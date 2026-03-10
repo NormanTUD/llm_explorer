@@ -1,11 +1,24 @@
 #!/usr/bin/env python3
-"""LLM Vector Space Explorer — single-file launcher. Run: python main.py"""
+"""LLM Vector Space Explorer — single-file. Run: python main.py"""
+
+# ══════════════════════════════════════════════════════════════
+# SECTION 0: THREADING FIX — must be before ANY other imports
+# ══════════════════════════════════════════════════════════════
+
+import os
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # ══════════════════════════════════════════════════════════════
 # SECTION 1: VENV BOOTSTRAP
 # ══════════════════════════════════════════════════════════════
 
-import sys, os, platform, subprocess, shutil
+import sys, platform, subprocess, shutil
 from pathlib import Path
 
 VENV = Path.home() / ".llm_explorer_venv"
@@ -52,7 +65,7 @@ def ensure_venv():
         install_deps()
     else:
         rc = subprocess.call(
-            [str(PY), "-c", "import dash, torch, transformers, umap"],
+            [str(PY), "-c", "import dash, torch, transformers, sklearn"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         if rc != 0:
@@ -79,11 +92,10 @@ if not in_venv():
 import numpy as np
 import logging
 
-os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 _CACHE = {}
+MAX_TOKENS = 5000  # sample size for overview — keeps PCA/KMeans fast
 
 # ── Layer 0: Atomic ──────────────────────────────────────────
 
@@ -94,17 +106,18 @@ def nrm(v):
     return float(np.linalg.norm(v))
 
 def topk(vals, k=10):
+    k = min(k, len(vals))
     return np.argsort(vals)[-k:][::-1]
 
 def csim_batch(X, v):
-    return X @ v / (np.linalg.norm(X, axis=1) * nrm(v) + 1e-9)
+    n = np.linalg.norm(X, axis=1) * nrm(v) + 1e-9
+    return X @ v / n
 
 # ── Layer 1: Model access ───────────────────────────────────
 
 MODELS = {
     "gpt2": "GPT-2 (117M)",
     "gpt2-medium": "GPT-2 Medium (345M)",
-    "gpt2-large": "GPT-2 Large (774M)",
     "distilgpt2": "DistilGPT-2 (82M)",
     "EleutherAI/pythia-70m": "Pythia 70M",
     "EleutherAI/pythia-160m": "Pythia 160M",
@@ -113,7 +126,7 @@ MODELS = {
 def load(name="gpt2"):
     if name not in _CACHE:
         from transformers import AutoModel, AutoTokenizer
-        print(f"  Loading {name} (cached at ~/.cache/huggingface/) ...")
+        print(f"  Loading {name} ...")
         tok = AutoTokenizer.from_pretrained(name)
         mdl = AutoModel.from_pretrained(name, output_attentions=True)
         mdl.eval()
@@ -122,25 +135,26 @@ def load(name="gpt2"):
     return _CACHE[name]
 
 def vocab(tok):
-    return {i: tok.decode([i]) for i in range(tok.vocab_size)}
+    if "vocab" not in _CACHE:
+        _CACHE["vocab"] = {i: tok.decode([i]) for i in range(tok.vocab_size)}
+    return _CACHE["vocab"]
 
 def param(model, key):
     d = dict(model.named_parameters())
     return d[key].detach().cpu().numpy() if key in d else None
 
-def layer_names(model):
-    return [n for n, _ in model.named_parameters()]
-
 def embed_matrix(model):
-    for k in ["wte.weight", "embed_tokens.weight", "embeddings.word_embeddings.weight"]:
-        w = param(model, k)
-        if w is not None:
-            return w
-    return next((p.detach().cpu().numpy() for n, p in model.named_parameters()
-                 if "embed" in n.lower() and p.dim() == 2), None)
-
-def get_heads(W, nh):
-    return W.reshape(W.shape[0], nh, -1).transpose(1, 0, 2)
+    cache_key = "embed_" + str(id(model))
+    if cache_key not in _CACHE:
+        for k in ["wte.weight", "embed_tokens.weight", "embeddings.word_embeddings.weight"]:
+            w = param(model, k)
+            if w is not None:
+                _CACHE[cache_key] = w
+                return w
+        w = next((p.detach().cpu().numpy() for n, p in model.named_parameters()
+                  if "embed" in n.lower() and p.dim() == 2), None)
+        _CACHE[cache_key] = w
+    return _CACHE[cache_key]
 
 def cfg(model, *keys):
     for k in keys:
@@ -151,6 +165,12 @@ def cfg(model, *keys):
 
 def n_heads(model):  return cfg(model, "n_head", "num_attention_heads")
 def n_layers(model): return cfg(model, "n_layer", "num_hidden_layers")
+
+def sample_indices(n_total, max_n=MAX_TOKENS):
+    """Return indices to subsample; keeps things fast."""
+    if n_total <= max_n:
+        return np.arange(n_total)
+    return np.sort(np.random.default_rng(42).choice(n_total, max_n, replace=False))
 
 # ── Layer 2: Tracing ─────────────────────────────────────────
 
@@ -180,32 +200,43 @@ def delta_path(path):
 # ── Layer 3: Space operations ────────────────────────────────
 
 def reduce(X, n=2, method="pca"):
+    if len(X) < 4:
+        pad = np.zeros((4, X.shape[1]))
+        pad[:len(X)] = X
+        X = pad
     if method == "pca":
         from sklearn.decomposition import PCA
-        p = PCA(n_components=n).fit(X)
+        nc = min(n, X.shape[0], X.shape[1])
+        p = PCA(n_components=nc).fit(X)
         return {"coords": p.transform(X), "method": method,
                 "info": {"variance": p.explained_variance_ratio_.tolist()}}
     if method == "umap":
         from umap import UMAP
-        return {"coords": UMAP(n_components=n).fit_transform(X),
+        nn = min(15, len(X) - 1)
+        return {"coords": UMAP(n_components=n, n_neighbors=nn).fit_transform(X),
                 "method": method, "info": {}}
     if method == "tsne":
         from sklearn.manifold import TSNE
-        return {"coords": TSNE(n_components=n, perplexity=min(30, len(X) - 1))
+        pp = min(30, len(X) - 1)
+        return {"coords": TSNE(n_components=n, perplexity=max(pp, 2))
                 .fit_transform(X), "method": method, "info": {}}
     raise ValueError(method)
 
 def cluster(X, method="kmeans", k=12):
+    k = min(k, len(X) - 1, 30)
+    if k < 2:
+        return np.zeros(len(X), dtype=int)
     if method == "kmeans":
         from sklearn.cluster import KMeans
-        return KMeans(n_clusters=min(k, len(X)), n_init=10, random_state=42).fit_predict(X)
+        return KMeans(n_clusters=k, n_init=5, random_state=42, max_iter=100).fit_predict(X)
     from sklearn.cluster import DBSCAN
     return DBSCAN(eps=0.5, min_samples=5).fit_predict(X)
 
 def neighbors(X, idx, k=20):
     sims = csim_batch(X, X[idx])
     top = topk(sims, k + 1)
-    return top[top != idx][:k], sims[top[top != idx][:k]]
+    top = top[top != idx][:k]
+    return top, sims[top]
 
 def search(X, voc, query, tok):
     ids = tok.encode(query)
@@ -217,7 +248,9 @@ def search(X, voc, query, tok):
 
 def cluster_examples(labels, voc, cid, n=10):
     idxs = np.where(labels == cid)[0]
-    sel = idxs[:n] if len(idxs) <= n else np.random.choice(idxs, n, replace=False)
+    if len(idxs) == 0:
+        return ["(empty)"]
+    sel = idxs[:n] if len(idxs) <= n else np.random.default_rng(42).choice(idxs, n, replace=False)
     return [voc.get(int(i), "?").strip() or "." for i in sel]
 
 def cluster_summary(labels, voc, n=10):
@@ -246,21 +279,23 @@ def shared_dims(X, ids, k=20):
     ratio = np.abs(V.mean(0)) / (V.std(0) + 1e-9)
     return topk(ratio, k)
 
-def dim_profile(X, idx):
-    return X[idx]
-
 def outlier_dims(vec, X, k=20):
     z = np.abs(vec - X.mean(0)) / (X.std(0) + 1e-9)
     return topk(z, k)
 
 # ── TeX strings ──────────────────────────────────────────────
 
-def tex_overview(X):
-    V, d = X.shape
-    return f"\\mathbf{{E}} \\in \\mathbb{{R}}^{{{V} \\times {d}}}"
+def tex_overview(E, n_sampled=None):
+    V, d = E.shape
+    s = f"\\mathbf{{E}} \\in \\mathbb{{R}}^{{{V} \\times {d}}}"
+    if n_sampled and n_sampled < V:
+        s += f"\\quad (\\text{{showing }} {n_sampled})"
+    return s
 
 def tex_pca(info):
     v = info.get("variance", [])
+    if not v:
+        return ""
     return ", ".join(f"\\sigma_{{{i+1}}}^2={x:.1%}" for i, x in enumerate(v[:3]))
 
 def tex_token(vec):
@@ -279,7 +314,7 @@ def tex_delta():
 
 import json
 import dash
-from dash import dcc, html, Input, Output, State, callback, no_update, ctx, ALL
+from dash import dcc, html, Input, Output, State, callback, no_update, ctx
 import plotly.graph_objects as go
 import plotly.express as px
 
@@ -287,43 +322,45 @@ DEFAULT_MODEL = "gpt2"
 DEFAULT_K = 12
 DEFAULT_VIZ = "scatter"
 DEFAULT_REDUCE = "pca"
-EMPTY_FIG = go.Figure().update_layout(
-    template="plotly_dark", height=300,
-    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-    xaxis=dict(visible=False), yaxis=dict(visible=False),
-    annotations=[dict(text="No data yet", showarrow=False,
-                       font=dict(size=16, color="#555"), xref="paper", yref="paper", x=0.5, y=0.5)]
-)
+
+def empty_fig(msg="No data yet"):
+    return go.Figure().update_layout(
+        template="plotly_dark", height=300,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(visible=False), yaxis=dict(visible=False),
+        annotations=[dict(text=msg, showarrow=False,
+                          font=dict(size=16, color="#555"),
+                          xref="paper", yref="paper", x=0.5, y=0.5)])
 
 # ── Navigation ────────────────────────────────────────────────
 
 def nav_push(stack, entry):
     return stack + [entry]
 
-def nav_pop(stack, to=-1):
-    return stack[:to] if to > 0 else stack[:max(len(stack) - 1, 1)]
+def nav_pop(stack):
+    return stack[:max(len(stack) - 1, 1)]
 
 def nav_current(stack):
     return stack[-1] if stack else {"level": "model", "id": DEFAULT_MODEL, "label": "GPT-2"}
 
-LEVEL_ICONS = {"model": "🏠", "cluster": "🔵", "token": "🔤",
-               "trace": "📈", "attention": "👁", "compare": "⚖️"}
+ICONS = {"model": "🏠", "cluster": "🔵", "token": "🔤",
+         "trace": "📈", "attention": "👁", "compare": "⚖️"}
 
 def nav_crumbs(stack):
     spans = []
     for i, s in enumerate(stack):
-        icon = LEVEL_ICONS.get(s.get("level", ""), "")
-        is_last = i == len(stack) - 1
+        icon = ICONS.get(s.get("level", ""), "")
+        last = i == len(stack) - 1
         spans.append(html.Span(
             f"{icon} {s['label']}",
             id={"type": "crumb", "index": i},
             style={"cursor": "pointer", "padding": "4px 10px", "margin": "0 2px",
                    "borderRadius": "6px", "fontSize": "13px",
-                   "background": "#4a9eff" if is_last else "#2a2a3a",
-                   "color": "#fff", "fontWeight": "bold" if is_last else "normal",
+                   "background": "#4a9eff" if last else "#2a2a3a",
+                   "color": "#fff", "fontWeight": "bold" if last else "normal",
                    "display": "inline-block"}
         ))
-        if not is_last:
+        if not last:
             spans.append(html.Span(" > ", style={"color": "#555"}))
     return spans
 
@@ -331,20 +368,19 @@ def level_label(stack):
     cur = nav_current(stack)
     return f"Depth {len(stack)} - {cur.get('level', 'model').title()} view"
 
-def init_stack(model_name):
-    return [{"level": "model", "id": model_name, "label": MODELS.get(model_name, model_name)}]
+def init_stack(mn):
+    return [{"level": "model", "id": mn, "label": MODELS.get(mn, mn)}]
 
 # ── Figures ───────────────────────────────────────────────────
 
-def _layout(fig, title="", h=550):
+def _lay(fig, title="", h=550):
     fig.update_layout(
         title=dict(text=title, font=dict(size=14)),
         template="plotly_dark", height=h,
         paper_bgcolor="rgba(13,13,26,0.8)", plot_bgcolor="rgba(26,26,46,0.6)",
         margin=dict(l=30, r=30, t=40, b=30),
         legend=dict(font=dict(size=10), bgcolor="rgba(0,0,0,0.3)"),
-        hoverlabel=dict(bgcolor="#1a1a2e", font_size=12),
-    )
+        hoverlabel=dict(bgcolor="#1a1a2e", font_size=12))
     return fig
 
 def fig_scatter(coords, labels, texts, title=""):
@@ -352,167 +388,189 @@ def fig_scatter(coords, labels, texts, title=""):
     for c in sorted(np.unique(labels)):
         mask = labels == c
         name = f"Cluster {c}" if c >= 0 else "Noise"
+        idxs = np.where(mask)[0]
         fig.add_trace(go.Scattergl(
             x=coords[mask, 0], y=coords[mask, 1], mode="markers",
             marker=dict(size=5, opacity=0.65),
-            text=[texts[i] for i in np.where(mask)[0]],
+            text=[texts[i] for i in idxs],
             hovertemplate="%{text}<extra>" + name + "</extra>",
-            name=name, customdata=np.where(mask)[0],
-        ))
-    return _layout(fig, title)
+            name=name, customdata=idxs.tolist()))
+    return _lay(fig, title)
 
-def fig_heatmap(matrix, xlabels, ylabels, title=""):
+def fig_heatmap(matrix, xl, yl, title=""):
     fig = go.Figure(go.Heatmap(
-        z=matrix, x=xlabels, y=ylabels, colorscale="Viridis",
-        hovertemplate="x=%{x}<br>y=%{y}<br>val=%{z:.3f}<extra></extra>"
-    ))
-    return _layout(fig, title, 500).update_layout(margin=dict(l=80, b=80))
+        z=matrix, x=xl, y=yl, colorscale="Viridis",
+        hovertemplate="x=%{x}<br>y=%{y}<br>val=%{z:.3f}<extra></extra>"))
+    return _lay(fig, title, 500).update_layout(margin=dict(l=80, b=80))
 
 def fig_bars(vec, title="Raw Dimensions", top_k=50):
     idx = topk(np.abs(vec), top_k)
     fig = go.Figure(go.Bar(
         x=[f"d{i}" for i in idx], y=vec[idx],
-        marker_color=["#4a9eff" if v > 0 else "#ff6b6b" for v in vec[idx]]
-    ))
-    return _layout(fig, title, 300).update_layout(margin=dict(l=30, r=10, t=35, b=30))
+        marker_color=["#4a9eff" if v > 0 else "#ff6b6b" for v in vec[idx]]))
+    return _lay(fig, title, 300).update_layout(margin=dict(l=30, r=10, t=35, b=30))
 
-def fig_radar(vec, dim_labels=None, top_k=12):
+def fig_radar(vec, top_k=12):
     idx = topk(np.abs(vec), top_k)
-    labs = [dim_labels[i] if dim_labels else f"d{i}" for i in idx]
     fig = go.Figure(go.Scatterpolar(
-        r=np.abs(vec[idx]), theta=labs, fill="toself",
-        marker=dict(color="#4a9eff"), line=dict(color="#4a9eff")
-    ))
-    return _layout(fig, h=350).update_layout(
+        r=np.abs(vec[idx]), theta=[f"d{i}" for i in idx], fill="toself",
+        marker=dict(color="#4a9eff"), line=dict(color="#4a9eff")))
+    return _lay(fig, h=350).update_layout(
         polar=dict(bgcolor="#1a1a2e", radialaxis=dict(visible=True, color="#555")),
         margin=dict(l=40, r=40, t=30, b=30))
 
-def fig_parallel(X, labels, dims=None, k=15):
-    if dims is None:
-        dims = topk(X.std(axis=0), k)
-    df_cols = {f"d{d}": X[:, d] for d in dims}
-    df_cols["cluster"] = labels
-    fig = px.parallel_coordinates(
-        df_cols, color="cluster", dimensions=[f"d{d}" for d in dims],
-        color_continuous_scale="Viridis"
-    )
-    return _layout(fig, h=450).update_layout(margin=dict(l=40, r=40))
+def fig_parallel(X, labels, k=15):
+    dims = topk(X.std(axis=0), k)
+    df = {f"d{d}": X[:, d] for d in dims}
+    df["cluster"] = labels
+    fig = px.parallel_coordinates(df, color="cluster",
+        dimensions=[f"d{d}" for d in dims], color_continuous_scale="Viridis")
+    return _lay(fig, h=450).update_layout(margin=dict(l=40, r=40))
 
-def fig_path(points, layer_labels):
+def fig_path(points, labels):
     r = reduce(points, n=2, method="pca")
     c = r["coords"]
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
+    fig = go.Figure(go.Scatter(
         x=c[:, 0], y=c[:, 1], mode="lines+markers+text",
-        text=layer_labels, textposition="top center", textfont=dict(size=10),
+        text=labels, textposition="top center", textfont=dict(size=10),
         marker=dict(size=9, color=list(range(len(c))), colorscale="Plasma",
                     showscale=True, colorbar=dict(title="Layer", thickness=10)),
-        line=dict(color="#666", dash="dot", width=1)
-    ))
-    return _layout(fig, "Token path through layers", 450)
+        line=dict(color="#666", dash="dot", width=1)))
+    return _lay(fig, "Token path through layers", 450)
 
-def fig_attn(attn_matrix, tokens, head=0, title=""):
-    m = attn_matrix[head] if attn_matrix.ndim == 3 else attn_matrix
-    return fig_heatmap(m, tokens, tokens, title=title or f"Attention Head {head}")
+def fig_attn(am, tokens, head=0, title=""):
+    m = am[head] if am.ndim == 3 else am
+    return fig_heatmap(m, tokens, tokens, title or f"Attention Head {head}")
 
 # ── Render engine ─────────────────────────────────────────────
 
-def render(stack, viz, red, k, model_name, trace_text="",
-           attn_layer=0, attn_head=0, trace_pos=0):
+def render(stack, viz, red, k, mn, trace_text="",
+           a_layer=0, a_head=0, t_pos=0):
     cur = nav_current(stack)
-    mdl, tok = load(model_name)
+    mdl, tok = load(mn)
     E = embed_matrix(mdl)
     voc = vocab(tok)
-    tex = tex_overview(E)
-    figs = {"main": EMPTY_FIG, "detail": EMPTY_FIG, "bars": EMPTY_FIG}
-    info = ""
+    figs = {"main": empty_fig(), "detail": empty_fig(), "bars": empty_fig()}
+    tex, info = "", ""
 
-    if cur["level"] == "model":
-        r = reduce(E, method=red)
-        labs = cluster(E, k=k)
-        summary = cluster_summary(labs, voc)
-        hover = [", ".join(summary.get(int(labs[i]), ["?"]))[:60] for i in range(len(E))]
-        figs["main"] = fig_scatter(r["coords"], labs, hover,
-                                    f"Embedding Space -- {model_name}")
-        tex += " \\quad " + tex_pca(r.get("info", {}))
-        st = manifold_stats(E, labs)
-        lines = [f"**C{cid}** ({st[cid]['size']} tok, spread {st[cid]['spread']:.2f}): "
-                 f"{', '.join(summary.get(cid, []))}" for cid in sorted(summary)]
-        info = "  \n".join(lines[:15])
-        if viz == "parallel":
-            figs["detail"] = fig_parallel(E, labs)
+    try:
+        if cur["level"] == "model":
+            # SAMPLE for speed
+            sidx = sample_indices(len(E))
+            Esub = E[sidx]
+            r = reduce(Esub, method=red)
+            labs = cluster(Esub, k=k)
+            # Map labels back to global vocab through sidx
+            smry = {}
+            for c in np.unique(labs):
+                if c < 0: continue
+                global_ids = sidx[labs == c]
+                ex = [voc.get(int(i), "?").strip() or "." for i in global_ids[:10]]
+                smry[int(c)] = ex
+            hover = [", ".join(smry.get(int(labs[i]), ["?"]))[:60] for i in range(len(Esub))]
+            figs["main"] = fig_scatter(r["coords"], labs, hover,
+                                        f"Embedding Space -- {mn} ({len(sidx)} tokens)")
+            tex = tex_overview(E, len(sidx))
+            pca_info = r.get("info", {})
+            if pca_info:
+                tex += " \\quad " + tex_pca(pca_info)
+            st = manifold_stats(Esub, labs)
+            lines = [f"**C{c}** ({st[c]['size']} tok): {', '.join(smry.get(c, []))}"
+                     for c in sorted(smry)]
+            info = "  \n".join(lines[:15])
+            if viz == "parallel":
+                figs["detail"] = fig_parallel(Esub, labs)
 
-    elif cur["level"] == "cluster":
-        cid = cur["id"]
-        labs = cluster(E, k=k)
-        mask = np.where(labs == cid)[0]
-        sub = E[mask]
-        r = reduce(sub, method=red)
-        hover = [voc.get(int(mask[i]), "?") for i in range(len(sub))]
-        figs["main"] = fig_scatter(r["coords"], np.zeros(len(sub), dtype=int), hover,
-                                    f"Cluster {cid} -- {len(mask)} tokens")
-        st = manifold_stats(E, labs)
-        tex = tex_cluster(st, cid)
-        examples = cluster_examples(labs, voc, cid, 20)
-        info = f"**Cluster {cid}** -- {len(mask)} tokens, spread {st[cid]['spread']:.3f}  \n"
-        info += f"Examples: {', '.join(examples)}"
-        if viz == "parallel":
-            figs["detail"] = fig_parallel(sub, np.zeros(len(sub), dtype=int))
+        elif cur["level"] == "cluster":
+            cid = cur["id"]
+            sidx = sample_indices(len(E))
+            Esub = E[sidx]
+            labs = cluster(Esub, k=k)
+            mask = np.where(labs == cid)[0]
+            if len(mask) == 0:
+                figs["main"] = empty_fig("Empty cluster")
+                return figs, tex, info
+            sub = Esub[mask]
+            r = reduce(sub, method=red)
+            global_ids = sidx[mask]
+            hover = [voc.get(int(global_ids[i]), "?") for i in range(len(sub))]
+            figs["main"] = fig_scatter(r["coords"], np.zeros(len(sub), dtype=int), hover,
+                                        f"Cluster {cid} -- {len(mask)} tokens")
+            st = manifold_stats(Esub, labs)
+            tex = tex_cluster(st, cid) if cid in st else ""
+            ex = [voc.get(int(i), "?").strip() or "." for i in global_ids[:20]]
+            info = f"**Cluster {cid}** -- {len(mask)} tokens  \n"
+            info += f"Examples: {', '.join(ex)}"
+            if viz == "parallel" and len(sub) > 2:
+                figs["detail"] = fig_parallel(sub, np.zeros(len(sub), dtype=int))
 
-    elif cur["level"] == "token":
-        tid = cur["id"]
-        vec = E[tid]
-        nbr_idx, nbr_sim = neighbors(E, tid, 30)
-        sub = E[np.concatenate([[tid], nbr_idx])]
-        r = reduce(sub, method=red)
-        hover = [voc.get(int(i), "?") for i in np.concatenate([[tid], nbr_idx])]
-        labs = np.array([1] + [0] * len(nbr_idx))
-        figs["main"] = fig_scatter(r["coords"], labs, hover,
-                                    f"Neighbors of '{voc.get(tid, '?').strip()}'")
-        figs["bars"] = fig_bars(vec) if viz in ("scatter", "bars") else fig_radar(vec)
-        tex = tex_token(vec)
-        od = outlier_dims(vec, E)
-        tex += f" \\quad \\text{{outlier dims: }}{list(od[:5])}"
-        nlist = [f"{voc.get(int(nbr_idx[i]), '?').strip()} ({nbr_sim[i]:.3f})"
-                 for i in range(min(15, len(nbr_idx)))]
-        info = f"**'{voc.get(tid, '?').strip()}'** -- top neighbors:  \n" + ", ".join(nlist)
+        elif cur["level"] == "token":
+            tid = cur["id"]
+            vec = E[tid]
+            nbr_idx, nbr_sim = neighbors(E, tid, 30)
+            all_ids = np.concatenate([[tid], nbr_idx])
+            sub = E[all_ids]
+            r = reduce(sub, method=red)
+            hover = [voc.get(int(i), "?") for i in all_ids]
+            labs = np.array([1] + [0] * len(nbr_idx))
+            figs["main"] = fig_scatter(r["coords"], labs, hover,
+                                        f"Neighbors of '{voc.get(tid, '?').strip()}'")
+            figs["bars"] = fig_bars(vec) if viz in ("scatter", "bars") else fig_radar(vec)
+            tex = tex_token(vec)
+            od = outlier_dims(vec, E)
+            tex += f" \\quad \\text{{outlier dims: }}{list(od[:5])}"
+            nlist = [f"{voc.get(int(nbr_idx[i]), '?').strip()} ({nbr_sim[i]:.3f})"
+                     for i in range(min(15, len(nbr_idx)))]
+            info = f"**'{voc.get(tid, '?').strip()}'** -- neighbors:  \n" + ", ".join(nlist)
 
-    elif cur["level"] == "trace":
-        acts = activations(mdl, tok, trace_text)
-        tids = token_ids(tok, trace_text)
-        tidx = min(trace_pos, len(tids) - 1)
-        path = token_path(acts, tidx)
-        layer_labels = [f"L{i}" for i in range(len(path))]
-        figs["main"] = fig_path(path, layer_labels)
-        figs["bars"] = fig_bars(delta_path(path).mean(0), "Mean delta across layers")
-        tex = tex_delta()
-        tokens_str = [voc.get(t, "?").strip() for t in tids]
-        info = f"Tracing **'{tokens_str[tidx]}'** (pos {tidx}) through {len(path)} layers  \n"
-        info += f"Tokens: {' | '.join(f'`{t}`' for t in tokens_str)}"
+        elif cur["level"] == "trace":
+            if not trace_text:
+                figs["main"] = empty_fig("Enter text and click Trace")
+                return figs, tex, info
+            acts = activations(mdl, tok, trace_text)
+            tids = token_ids(tok, trace_text)
+            tidx = min(t_pos, len(tids) - 1)
+            path = token_path(acts, tidx)
+            ll = [f"L{i}" for i in range(len(path))]
+            figs["main"] = fig_path(path, ll)
+            dp = delta_path(path)
+            if len(dp) > 0:
+                figs["bars"] = fig_bars(dp.mean(0), "Mean delta across layers")
+            tex = tex_delta()
+            tstr = [voc.get(t, "?").strip() for t in tids]
+            info = f"Tracing **'{tstr[tidx]}'** (pos {tidx}) through {len(path)} layers  \n"
+            info += f"Tokens: {' | '.join(f'`{t}`' for t in tstr)}"
 
-    elif cur["level"] == "attention":
-        am = attn_maps(mdl, tok, trace_text)
-        tids = token_ids(tok, trace_text)
-        tokens = [voc.get(t, "?").strip() for t in tids]
-        layer = min(attn_layer, len(am) - 1)
-        head_idx = min(attn_head, am[layer].shape[0] - 1)
-        figs["main"] = fig_attn(am[layer], tokens, head_idx,
-                                 f"Layer {layer} Head {head_idx}")
-        tex = f"\\text{{Layer }}={layer},\\; \\text{{Head }}={head_idx}"
-        info = f"**Attention** -- Layer {layer}/{len(am)-1}, Head {head_idx}  \n"
-        info += f"Tokens: {' -> '.join(tokens)}"
+        elif cur["level"] == "attention":
+            if not trace_text:
+                figs["main"] = empty_fig("Enter text and click Attention")
+                return figs, tex, info
+            am = attn_maps(mdl, tok, trace_text)
+            tids = token_ids(tok, trace_text)
+            tokens = [voc.get(t, "?").strip() for t in tids]
+            ly = min(a_layer, len(am) - 1)
+            hd = min(a_head, am[ly].shape[0] - 1)
+            figs["main"] = fig_attn(am[ly], tokens, hd, f"Layer {ly} Head {hd}")
+            tex = f"\\text{{Layer }}={ly},\\; \\text{{Head }}={hd}"
+            info = f"**Attention** -- Layer {ly}/{len(am)-1}, Head {hd}  \n"
+            info += f"Tokens: {' -> '.join(tokens)}"
 
-    elif cur["level"] == "compare":
-        ids = cur.get("ids", [])
-        if len(ids) >= 2:
-            sim_mat = compare_tokens(E, ids)
-            labels = [voc.get(int(i), "?").strip() for i in ids]
-            figs["main"] = fig_heatmap(sim_mat, labels, labels, "Token Similarity")
-            sd = shared_dims(E, ids)
-            figs["bars"] = fig_bars(E[ids].mean(0), f"Shared profile -- top dims: {list(sd[:5])}")
-            tex = f"\\text{{Comparing }} {len(ids)} \\text{{ tokens}}"
-            info = f"**Comparing:** {', '.join(labels)}  \n"
-            info += f"Shared dims (high agreement): {list(sd[:10])}"
+        elif cur["level"] == "compare":
+            ids = cur.get("ids", [])
+            if len(ids) >= 2:
+                sm = compare_tokens(E, ids)
+                lb = [voc.get(int(i), "?").strip() for i in ids]
+                figs["main"] = fig_heatmap(sm, lb, lb, "Token Similarity")
+                sd = shared_dims(E, ids)
+                figs["bars"] = fig_bars(E[ids].mean(0),
+                    f"Shared profile -- top dims: {list(sd[:5])}")
+                tex = f"\\text{{Comparing }} {len(ids)} \\text{{ tokens}}"
+                info = f"**Comparing:** {', '.join(lb)}  \n"
+                info += f"Shared dims: {list(sd[:10])}"
+
+    except Exception as e:
+        print(f"  Render error: {e}")
+        figs["main"] = empty_fig(f"Error: {str(e)[:80]}")
 
     return figs, tex, info
 
@@ -535,7 +593,7 @@ body { background: #0d0d1a; color: #eee; font-family: 'Segoe UI', system-ui, san
 }
 .sb-section label { font-size: 11px; color: #8888aa; margin-top: 6px; display: block;
     text-transform: uppercase; letter-spacing: 0.5px; }
-.main { margin-left: 280px; padding: 16px 20px; }
+.main { margin-left: 280px; padding: 16px 20px; padding-bottom: 40px; }
 input, select {
     background: #2a2a3a; color: #eee; border: 1px solid #3a3a5a;
     border-radius: 6px; padding: 7px 10px; width: 100%; font-size: 13px;
@@ -576,27 +634,25 @@ button:hover { background: #3a8eef; }
 }
 </style></head><body>{%app_entry%}{%config%}{%scripts%}{%renderer%}</body></html>'''
 
-def _section(title, children):
+def _sec(title, children):
     return html.Div(className="sb-section", children=[
         html.Div(title, style={"fontSize": "12px", "fontWeight": "700",
                                 "color": "#6a6a9a", "marginBottom": "6px"}),
-        *children
-    ])
+        *children])
 
 sidebar = html.Div(className="sidebar", children=[
     html.H3("🔬 LLM Explorer", style={"margin": "0 0 4px", "fontSize": "18px"}),
     html.Div("Vector Space Interpretability", style={"fontSize": "10px", "color": "#555",
               "marginBottom": "14px", "letterSpacing": "1px", "textTransform": "uppercase"}),
 
-    _section("Model", [
+    _sec("Model", [
         html.Label("Select model"),
         dcc.Dropdown(id="model-sel",
             options=[{"label": v, "value": k} for k, v in MODELS.items()],
             value=DEFAULT_MODEL, clearable=False,
             style={"background": "#2a2a3a", "color": "#000", "fontSize": "12px"}),
     ]),
-
-    _section("Visualization", [
+    _sec("Visualization", [
         html.Label("Plot type"),
         dcc.RadioItems(id="viz-type",
             options=[{"label": v, "value": k} for k, v in
@@ -615,16 +671,14 @@ sidebar = html.Div(className="sidebar", children=[
                    marks={i: str(i) for i in [3, 8, 12, 20, 30]},
                    tooltip={"placement": "bottom"}),
     ]),
-
-    _section("Search", [
-        html.Label("Find token in embedding space"),
+    _sec("Search", [
+        html.Label("Find token"),
         dcc.Input(id="search-box", placeholder="type a word...", debounce=True),
         html.Button("Search", id="search-btn", n_clicks=0),
         html.Div(id="search-results", style={"fontSize": "11px", "color": "#8888aa",
                   "marginTop": "4px", "maxHeight": "80px", "overflowY": "auto"}),
     ]),
-
-    _section("Trace & Attention", [
+    _sec("Trace & Attention", [
         html.Label("Input text"),
         dcc.Input(id="trace-box", placeholder="The cat sat on", debounce=True),
         html.Div(style={"display": "flex", "gap": "4px"}, children=[
@@ -641,13 +695,11 @@ sidebar = html.Div(className="sidebar", children=[
         dcc.Slider(id="attn-head", min=0, max=11, step=1, value=0,
                    marks=None, tooltip={"placement": "bottom"}),
     ]),
-
-    _section("Compare", [
+    _sec("Compare", [
         html.Label("Comma-separated tokens"),
         dcc.Input(id="compare-box", placeholder="king,queen,man,woman", debounce=True),
         html.Button("Compare", id="compare-btn", n_clicks=0),
     ]),
-
     html.Button("Back", id="back-btn", n_clicks=0, className="btn-secondary",
                 style={"marginTop": "8px"}),
 ])
@@ -671,18 +723,14 @@ main_area = html.Div(className="main", children=[
     html.Div(style={"display": "flex", "gap": "10px"}, children=[
         html.Div(className="plot-card", style={"flex": "1"}, children=[
             dcc.Loading(type="dot", color="#4a9eff", children=[
-                dcc.Graph(id="detail-plot"),
-            ])
-        ]),
+                dcc.Graph(id="detail-plot")])]),
         html.Div(className="plot-card", style={"flex": "1"}, children=[
             dcc.Loading(type="dot", color="#4a9eff", children=[
-                dcc.Graph(id="bars-plot"),
-            ])
-        ]),
+                dcc.Graph(id="bars-plot")])]),
     ]),
     dcc.Store(id="nav-store", data=json.dumps(init_stack(DEFAULT_MODEL))),
     html.Div(className="status-bar", children=[
-        html.Span(id="status-left", children="Ready"),
+        html.Span(id="status-left", children="Loading..."),
         html.Span(id="status-right", children="LLM Vector Space Explorer v0.1"),
     ]),
 ])
@@ -727,25 +775,27 @@ app.layout = html.Div([sidebar, main_area])
     State("compare-box", "value"),
     prevent_initial_call=False,
 )
-def master_callback(click, back_n, search_n, trace_n, attn_n, compare_n,
-                    model_name, viz, red, k, attn_layer_val, attn_head_val, trace_pos_val,
-                    nav_json, search_q, trace_txt, compare_txt):
+def master_cb(click, back_n, search_n, trace_n, attn_n, compare_n,
+              model_name, viz, red, k, a_layer, a_head, t_pos,
+              nav_json, search_q, trace_txt, compare_txt):
 
-    stack = json.loads(nav_json) if nav_json else init_stack(model_name or DEFAULT_MODEL)
-    triggered = ctx.triggered_id if ctx.triggered_id else "init"
-    search_res = no_update
     mn = model_name or DEFAULT_MODEL
+    stack = json.loads(nav_json) if nav_json else init_stack(mn)
+    triggered = ctx.triggered_id or "init"
+    search_res = no_update
 
     mdl, tok = load(mn)
     E = embed_matrix(mdl)
     voc = vocab(tok)
 
-    max_layer = n_layers(mdl) - 1
-    max_head = n_heads(mdl) - 1
-    max_trace = 20
+    mx_layer = n_layers(mdl) - 1
+    mx_head = n_heads(mdl) - 1
+    mx_trace = 20
 
-    # ── Navigation triggers ──
+    # ── Nav triggers ──
     if triggered == "model-sel":
+        # Clear vocab cache on model switch
+        _CACHE.pop("vocab", None)
         stack = init_stack(mn)
 
     elif triggered == "back-btn":
@@ -755,43 +805,44 @@ def master_callback(click, back_n, search_n, trace_n, attn_n, compare_n,
         pt = click["points"][0]
         cur = nav_current(stack)
         if cur["level"] == "model":
-            labs = cluster(E, k=k)
-            idx = pt.get("customdata", pt.get("pointIndex", 0))
-            cid = int(labs[int(idx)])
-            ex = cluster_examples(labs, voc, cid, 5)
+            sidx = sample_indices(len(E))
+            labs = cluster(E[sidx], k=k)
+            ci = pt.get("customdata", pt.get("pointIndex", 0))
+            cid = int(labs[int(ci)])
+            gids = sidx[labs == cid]
+            ex = [voc.get(int(i), "?").strip() or "." for i in gids[:5]]
             stack = nav_push(stack, {"level": "cluster", "id": cid,
                 "label": f"C{cid}: {', '.join(ex)}"})
         elif cur["level"] == "cluster":
             cid = cur["id"]
-            labs = cluster(E, k=k)
+            sidx = sample_indices(len(E))
+            labs = cluster(E[sidx], k=k)
             mask = np.where(labs == cid)[0]
             li = int(pt.get("customdata", pt.get("pointIndex", 0)))
-            tid = int(mask[li]) if li < len(mask) else int(mask[0])
-            stack = nav_push(stack, {"level": "token", "id": tid,
-                "label": f"'{voc.get(tid, '?').strip()}'"})
+            gid = int(sidx[mask[li]]) if li < len(mask) else int(sidx[mask[0]])
+            stack = nav_push(stack, {"level": "token", "id": gid,
+                "label": f"'{voc.get(gid, '?').strip()}'"})
         elif cur["level"] == "token":
             nbr_idx, _ = neighbors(E, cur["id"], 30)
-            all_ids = np.concatenate([[cur["id"]], nbr_idx])
+            ai = np.concatenate([[cur["id"]], nbr_idx])
             li = int(pt.get("customdata", pt.get("pointIndex", 0)))
-            new_tid = int(all_ids[li]) if li < len(all_ids) else cur["id"]
-            stack = nav_push(stack, {"level": "token", "id": new_tid,
-                "label": f"'{voc.get(new_tid, '?').strip()}'"})
+            ntid = int(ai[li]) if li < len(ai) else cur["id"]
+            stack = nav_push(stack, {"level": "token", "id": ntid,
+                "label": f"'{voc.get(ntid, '?').strip()}'"})
 
     elif triggered == "search-btn" and search_q:
-        results = search(E, voc, search_q, tok)
-        if results:
-            tid = results[0][0]
-            stack = nav_push(stack, {"level": "token", "id": tid,
-                "label": f"'{voc.get(tid, '?').strip()}'"})
+        res = search(E, voc, search_q, tok)
+        if res:
+            stack = nav_push(stack, {"level": "token", "id": res[0][0],
+                "label": f"'{voc.get(res[0][0], '?').strip()}'"})
             search_res = [html.Div(f"{r[2].strip()} ({r[1]:.3f})",
-                          style={"padding": "1px 0", "borderBottom": "1px solid #1f1f3a"})
-                          for r in results[:8]]
+                          style={"padding": "1px 0"}) for r in res[:8]]
         else:
             search_res = [html.Div("No results", style={"color": "#f88"})]
 
     elif triggered == "trace-btn" and trace_txt:
         tids = token_ids(tok, trace_txt)
-        max_trace = max(len(tids) - 1, 0)
+        mx_trace = max(len(tids) - 1, 0)
         stack = nav_push(stack, {"level": "trace", "id": trace_txt,
             "label": f"Trace: '{trace_txt[:20]}'"})
 
@@ -800,41 +851,38 @@ def master_callback(click, back_n, search_n, trace_n, attn_n, compare_n,
             "label": f"Attn: '{trace_txt[:20]}'"})
 
     elif triggered == "compare-btn" and compare_txt:
-        words = [w.strip() for w in compare_txt.split(",") if w.strip()]
-        ids = [tok.encode(w)[0] for w in words if tok.encode(w)]
+        ws = [w.strip() for w in compare_txt.split(",") if w.strip()]
+        ids = [tok.encode(w)[0] for w in ws if tok.encode(w)]
         if len(ids) >= 2:
-            labs = [voc.get(i, "?").strip() for i in ids]
+            lb = [voc.get(i, "?").strip() for i in ids]
             stack = nav_push(stack, {"level": "compare", "ids": ids,
-                "label": f"Compare: {', '.join(labs[:4])}"})
+                "label": f"Compare: {', '.join(lb[:4])}"})
 
-    # Update trace pos max
     cur = nav_current(stack)
     if cur.get("level") == "trace" and trace_txt:
-        max_trace = max(len(token_ids(tok, trace_txt)) - 1, 0)
+        mx_trace = max(len(token_ids(tok, trace_txt)) - 1, 0)
 
     # ── Render ──
     figs, tex, info = render(stack, viz, red, k, mn, trace_txt or "",
-                              attn_layer_val or 0, attn_head_val or 0, trace_pos_val or 0)
+                              a_layer or 0, a_head or 0, t_pos or 0)
 
     math_str = f"$${tex}$$" if tex else ""
-    crumbs = nav_crumbs(stack)
-    depth = level_label(stack)
-    status = f"Model: {mn} | {E.shape[0]} tokens x {E.shape[1]}d | {cur.get('level', '?')}"
+    status = f"{mn} | {E.shape[0]} tok x {E.shape[1]}d | {cur.get('level', '?')}"
     info_style = {"display": "block"} if info else {"display": "none"}
 
     return (json.dumps(stack),
-            figs["main"], figs.get("detail", EMPTY_FIG), figs.get("bars", EMPTY_FIG),
-            crumbs, depth, math_str,
+            figs["main"], figs.get("detail", empty_fig()), figs.get("bars", empty_fig()),
+            nav_crumbs(stack), level_label(stack), math_str,
             dcc.Markdown(info) if info else "", info_style,
             search_res, status,
-            max_layer, max_head, max_trace)
+            mx_layer, mx_head, mx_trace)
 
 # ══════════════════════════════════════════════════════════════
 # RUN
 # ══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print("\n  LLM Vector Space Explorer")
+    print("\n  🔬 LLM Vector Space Explorer")
     print("  http://127.0.0.1:8050\n")
-    app.run(debug=True, host="127.0.0.1", port=8050)
+    app.run(debug=False, host="127.0.0.1", port=8050)
 
