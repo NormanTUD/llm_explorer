@@ -1,6 +1,7 @@
 """core.py — Model loading, math, clustering, search. No UI imports."""
 
 import numpy as np
+from rich.panel import Panel
 
 _CACHE = {}
 
@@ -21,17 +22,36 @@ def csim_batch(X, v):
 
 # ── Layer 1: Model access ───────────────────────────────────
 
-def load(name="gpt2"):
+# ── Layer 1: Model access ───────────────────────────────────
+
+def load(con, name="gpt2"):
     if name not in _CACHE:
-        from transformers import AutoModel, AutoTokenizer
-        tok = AutoTokenizer.from_pretrained(name)
-        mdl = AutoModel.from_pretrained(name, output_attentions=True)
-        mdl.eval()
-        _CACHE[name] = (mdl, tok)
+        with con.status(f"[bold cyan]Loading {name}...", spinner="dots"):
+            try:
+                from transformers import AutoModel, AutoTokenizer
+            except ImportError as e:
+                con.print(f"[bold red]Cannot import transformers: {e}")
+                con.print("[yellow]Try: pip install torch transformers --upgrade")
+                raise
+            tok = AutoTokenizer.from_pretrained(name)
+            mdl = AutoModel.from_pretrained(name, output_attentions=True)
+            mdl.eval()
+            _CACHE[name] = (mdl, tok)
+        V = tok.vocab_size
+        d = next(p for p in mdl.parameters() if p.dim() == 2).shape[-1]
+        con.print(Panel(
+            f"[green]{name}[/green] ready — {V:,} tokens × {d}d",
+            title="Model Loaded", border_style="green"
+        ))
     return _CACHE[name]
 
-def vocab(tok):
-    return {i: tok.decode([i]) for i in range(tok.vocab_size)}
+def vocab(con, tok):
+    key = f"vocab_{id(tok)}"
+    if key not in _CACHE:
+        with con.status("[dim]Building vocab map...", spinner="dots"):
+            _CACHE[key] = {i: tok.decode([i]) for i in range(tok.vocab_size)}
+        con.print(f"  [dim]Vocab: {tok.vocab_size:,} tokens mapped[/dim]")
+    return _CACHE[key]
 
 def param(model, key):
     d = dict(model.named_parameters())
@@ -161,7 +181,55 @@ def dim_profile(X, idx):
 
 def outlier_dims(vec, X, k=20):
     z = np.abs(vec - X.mean(0)) / (X.std(0) + 1e-9)
-    return topk(z, k)
+    return [int(i) for i in topk(z, k)]
+
+def nearest_word(vec, E, voc, k=3):
+    """Find k nearest vocab words to a vector by cosine sim."""
+    if nrm(vec) < 1e-9:
+        return [("·", 0.0)] * k
+    sims = csim_batch(E, vec)
+    top = topk(sims, k)
+    return [(voc.get(int(i), "?").strip() or "·", float(sims[i])) for i in top]
+
+def trace_words(acts, E, voc, tidx):
+    """For a token position, find nearest word at each layer."""
+    rows = []
+    for layer_i in sorted(acts):
+        vec = acts[layer_i][tidx]
+        nw = nearest_word(vec, E, voc, 3)
+        rows.append({"layer": layer_i, "words": nw, "norm": nrm(vec)})
+    return rows
+
+# ── TeX strings ──────────────────────────────────────────────
+
+def _c(v):
+    """Clean numpy types for TeX."""
+    if isinstance(v, (list, np.ndarray)):
+        return [int(x) for x in v]
+    return int(v) if hasattr(v, 'item') else v
+
+def tex_overview(E, n_sampled=None):
+    V, d = E.shape
+    s = f"\\mathbf{{E}} \\in \\mathbb{{R}}^{{{V} \\times {d}}}"
+    if n_sampled and n_sampled < V:
+        s += f"\\quad (\\text{{showing }} {n_sampled})"
+    return s
+
+def tex_pca(info):
+    v = info.get("variance", [])
+    if not v:
+        return ""
+    return ", ".join(f"\\sigma_{{{i+1}}}^2={x:.1%}" for i, x in enumerate(v[:3]))
+
+def tex_token(vec):
+    return f"\\|\\mathbf{{v}}\\| = {nrm(vec):.2f},\\; d = {len(vec)}"
+
+def tex_cluster(stats, cid):
+    s = stats.get(cid, {})
+    return f"n={s.get('size', '?')},\\; \\bar{{d}}_{{intra}}={s.get('spread', 0):.3f}"
+
+def tex_delta():
+    return "\\Delta_l = \\mathbf{h}^{(l)} - \\mathbf{h}^{(l-1)}"
 
 # ── Layer 5: Available models ────────────────────────────────
 

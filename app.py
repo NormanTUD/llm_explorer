@@ -13,6 +13,16 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["OPENBLAS_VERBOSE"] = "0"
+
+MODELS = {
+    "gpt2": "GPT-2 (117M)",
+    "gpt2-medium": "GPT-2 Medium (345M)",
+    "distilgpt2": "DistilGPT-2 (82M)",
+    "EleutherAI/pythia-70m": "Pythia 70M",
+    "EleutherAI/pythia-160m": "Pythia 160M",
+}
 
 # ══════════════════════════════════════════════════════════════
 # SECTION 1: VENV BOOTSTRAP
@@ -20,6 +30,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import sys, platform, subprocess, shutil
 from pathlib import Path
+from core import *
+from views import *
 
 VENV = Path.home() / ".llm_explorer_venv"
 IS_WIN = platform.system() == "Windows"
@@ -30,7 +42,7 @@ PIP = BIN / ("pip.exe" if IS_WIN else "pip")
 DEPS = [
     "dash", "plotly", "numpy", "scikit-learn",
     "torch --index-url https://download.pytorch.org/whl/cpu",
-    "transformers", "umap-learn",
+    "transformers", "umap-learn", "rich",
 ]
 
 def in_venv():
@@ -65,7 +77,7 @@ def ensure_venv():
         install_deps()
     else:
         rc = subprocess.call(
-            [str(PY), "-c", "import dash, torch, transformers, sklearn"],
+            [str(PY), "-c", "import dash, torch, transformers, sklearn, rich"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         if rc != 0:
@@ -94,8 +106,15 @@ import logging
 
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich import print as rprint
+
+con = Console()
+
 _CACHE = {}
-MAX_TOKENS = 5000  # sample size for overview — keeps PCA/KMeans fast
+MAX_TOKENS = 5000
 
 # ── Layer 0: Atomic ──────────────────────────────────────────
 
@@ -110,67 +129,11 @@ def topk(vals, k=10):
     return np.argsort(vals)[-k:][::-1]
 
 def csim_batch(X, v):
-    n = np.linalg.norm(X, axis=1) * nrm(v) + 1e-9
+    v_norm = nrm(v)
+    if v_norm < 1e-9:
+        return np.zeros(len(X))
+    n = np.linalg.norm(X, axis=1) * v_norm + 1e-9
     return X @ v / n
-
-# ── Layer 1: Model access ───────────────────────────────────
-
-MODELS = {
-    "gpt2": "GPT-2 (117M)",
-    "gpt2-medium": "GPT-2 Medium (345M)",
-    "distilgpt2": "DistilGPT-2 (82M)",
-    "EleutherAI/pythia-70m": "Pythia 70M",
-    "EleutherAI/pythia-160m": "Pythia 160M",
-}
-
-def load(name="gpt2"):
-    if name not in _CACHE:
-        from transformers import AutoModel, AutoTokenizer
-        print(f"  Loading {name} ...")
-        tok = AutoTokenizer.from_pretrained(name)
-        mdl = AutoModel.from_pretrained(name, output_attentions=True)
-        mdl.eval()
-        _CACHE[name] = (mdl, tok)
-        print(f"  Done: {name}")
-    return _CACHE[name]
-
-def vocab(tok):
-    if "vocab" not in _CACHE:
-        _CACHE["vocab"] = {i: tok.decode([i]) for i in range(tok.vocab_size)}
-    return _CACHE["vocab"]
-
-def param(model, key):
-    d = dict(model.named_parameters())
-    return d[key].detach().cpu().numpy() if key in d else None
-
-def embed_matrix(model):
-    cache_key = "embed_" + str(id(model))
-    if cache_key not in _CACHE:
-        for k in ["wte.weight", "embed_tokens.weight", "embeddings.word_embeddings.weight"]:
-            w = param(model, k)
-            if w is not None:
-                _CACHE[cache_key] = w
-                return w
-        w = next((p.detach().cpu().numpy() for n, p in model.named_parameters()
-                  if "embed" in n.lower() and p.dim() == 2), None)
-        _CACHE[cache_key] = w
-    return _CACHE[cache_key]
-
-def cfg(model, *keys):
-    for k in keys:
-        v = getattr(model.config, k, None)
-        if v is not None:
-            return v
-    return 12
-
-def n_heads(model):  return cfg(model, "n_head", "num_attention_heads")
-def n_layers(model): return cfg(model, "n_layer", "num_hidden_layers")
-
-def sample_indices(n_total, max_n=MAX_TOKENS):
-    """Return indices to subsample; keeps things fast."""
-    if n_total <= max_n:
-        return np.arange(n_total)
-    return np.sort(np.random.default_rng(42).choice(n_total, max_n, replace=False))
 
 # ── Layer 2: Tracing ─────────────────────────────────────────
 
@@ -430,13 +393,34 @@ def fig_parallel(X, labels, k=15):
 def fig_path(points, labels):
     r = reduce(points, n=2, method="pca")
     c = r["coords"]
-    fig = go.Figure(go.Scatter(
-        x=c[:, 0], y=c[:, 1], mode="lines+markers+text",
-        text=labels, textposition="top center", textfont=dict(size=10),
-        marker=dict(size=9, color=list(range(len(c))), colorscale="Plasma",
-                    showscale=True, colorbar=dict(title="Layer", thickness=10)),
-        line=dict(color="#666", dash="dot", width=1)))
-    return _lay(fig, "Token path through layers", 450)
+    fig = go.Figure()
+    # Line trace (background path)
+    fig.add_trace(go.Scatter(
+        x=c[:, 0], y=c[:, 1], mode="lines",
+        line=dict(color="#444", dash="dot", width=1),
+        showlegend=False, hoverinfo="skip"))
+    # Arrow markers at each layer
+    fig.add_trace(go.Scatter(
+        x=c[:, 0], y=c[:, 1], mode="markers+text",
+        text=labels, textposition="top center", textfont=dict(size=9, color="#ccc"),
+        marker=dict(
+            size=12, symbol="arrow", angleref="previous",
+            color=list(range(len(c))), colorscale="Plasma",
+            showscale=True, colorbar=dict(title="Layer", thickness=10),
+            line=dict(width=1, color="#fff")),
+        hovertemplate="%{text}<extra>Layer %{marker.color}</extra>",
+        showlegend=False))
+    # Start marker
+    fig.add_trace(go.Scatter(
+        x=[c[0, 0]], y=[c[0, 1]], mode="markers",
+        marker=dict(size=16, color="#00ff88", symbol="star", line=dict(width=2, color="#000")),
+        name="Start", hovertemplate=f"{labels[0]}<extra>Start</extra>"))
+    # End marker
+    fig.add_trace(go.Scatter(
+        x=[c[-1, 0]], y=[c[-1, 1]], mode="markers",
+        marker=dict(size=16, color="#ff4444", symbol="diamond", line=dict(width=2, color="#000")),
+        name="End", hovertemplate=f"{labels[-1]}<extra>End</extra>"))
+    return _lay(fig, "Token trajectory through layers", 500)
 
 def fig_attn(am, tokens, head=0, title=""):
     m = am[head] if am.ndim == 3 else am
@@ -444,12 +428,12 @@ def fig_attn(am, tokens, head=0, title=""):
 
 # ── Render engine ─────────────────────────────────────────────
 
-def render(stack, viz, red, k, mn, trace_text="",
+def render(con, stack, viz, red, k, mn, trace_text="",
            a_layer=0, a_head=0, t_pos=0):
     cur = nav_current(stack)
     mdl, tok = load(mn)
     E = embed_matrix(mdl)
-    voc = vocab(tok)
+    voc = vocab(con, tok)
     figs = {"main": empty_fig(), "detail": empty_fig(), "bars": empty_fig()}
     tex, info = "", ""
 
@@ -595,9 +579,17 @@ body { background: #0d0d1a; color: #eee; font-family: 'Segoe UI', system-ui, san
     text-transform: uppercase; letter-spacing: 0.5px; }
 .main { margin-left: 280px; padding: 16px 20px; padding-bottom: 40px; }
 input, select {
-    background: #2a2a3a; color: #eee; border: 1px solid #3a3a5a;
+    background: #1e1e30; color: #f0f0f0; border: 1px solid #3a3a5a;
     border-radius: 6px; padding: 7px 10px; width: 100%; font-size: 13px;
 }
+input:focus { border-color: #4a9eff; outline: none; box-shadow: 0 0 0 2px rgba(74,158,255,0.2); }
+input::placeholder { color: #666; }
+/* Dash dropdown overrides */
+.Select-control, .Select-menu-outer { background: #1e1e30 !important; }
+.Select-value-label, .Select-input input { color: #f0f0f0 !important; }
+.Select-placeholder { color: #666 !important; }
+.VirtualizedSelectOption { background: #1e1e30; color: #f0f0f0; }
+.VirtualizedSelectFocusedOption { background: #3a3a5a !important; }
 input:focus { border-color: #4a9eff; outline: none; }
 button {
     background: #4a9eff; color: #fff; border: none; border-radius: 6px;
@@ -786,7 +778,7 @@ def master_cb(click, back_n, search_n, trace_n, attn_n, compare_n,
 
     mdl, tok = load(mn)
     E = embed_matrix(mdl)
-    voc = vocab(tok)
+    voc = vocab(con, tok)
 
     mx_layer = n_layers(mdl) - 1
     mx_head = n_heads(mdl) - 1
@@ -794,9 +786,12 @@ def master_cb(click, back_n, search_n, trace_n, attn_n, compare_n,
 
     # ── Nav triggers ──
     if triggered == "model-sel":
-        # Clear vocab cache on model switch
-        _CACHE.pop("vocab", None)
+        # Clear stale caches on model switch
+        keys_to_clear = [k for k in _CACHE if k.startswith("vocab_") or k.startswith("embed_")]
+        for k in keys_to_clear:
+            _CACHE.pop(k, None)
         stack = init_stack(mn)
+        con.print(f"[bold cyan]Switching to {mn}...[/bold cyan]")
 
     elif triggered == "back-btn":
         stack = nav_pop(stack)
@@ -863,7 +858,7 @@ def master_cb(click, back_n, search_n, trace_n, attn_n, compare_n,
         mx_trace = max(len(token_ids(tok, trace_txt)) - 1, 0)
 
     # ── Render ──
-    figs, tex, info = render(stack, viz, red, k, mn, trace_txt or "",
+    figs, tex, info = render(con, stack, viz, red, k, mn, trace_txt or "",
                               a_layer or 0, a_head or 0, t_pos or 0)
 
     math_str = f"$${tex}$$" if tex else ""
@@ -882,7 +877,14 @@ def master_cb(click, back_n, search_n, trace_n, attn_n, compare_n,
 # ══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print("\n  🔬 LLM Vector Space Explorer")
-    print("  http://127.0.0.1:8050\n")
+    con.print(Panel.fit(
+        "[bold green]LLM Vector Space Explorer[/bold green]\n"
+        "[link=http://127.0.0.1:8050]http://127.0.0.1:8050[/link]",
+        border_style="cyan", title="🔬 Ready"
+    ))
+    # Pre-load default model so first page load is fast
+    try:
+        load(con, DEFAULT_MODEL)
+    except Exception:
+        con.print_exception(show_locals=False)
     app.run(debug=False, host="127.0.0.1", port=8050)
-
