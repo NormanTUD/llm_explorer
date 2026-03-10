@@ -81,6 +81,12 @@ def cfg(model, *keys):
 def n_heads(model):  return cfg(model, "n_head", "num_attention_heads")
 def n_layers(model): return cfg(model, "n_layer", "num_hidden_layers")
 
+def sample_indices(n_total, max_n=5000):
+    """Return indices to subsample; keeps PCA/KMeans fast."""
+    if n_total <= max_n:
+        return np.arange(n_total)
+    return np.sort(np.random.default_rng(42).choice(n_total, max_n, replace=False))
+
 # ── Layer 2: Tracing & activations ──────────────────────────
 
 def _forward(model, tok, text):
