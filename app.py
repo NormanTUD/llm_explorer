@@ -566,6 +566,9 @@ app.index_string = '''<!DOCTYPE html>
 <html><head>{%metas%}<title>LLM Vector Space Explorer</title>{%css%}<style>
 * { box-sizing: border-box; }
 body { background: #0d0d1a; color: #eee; font-family: 'Segoe UI', system-ui, sans-serif; margin: 0; }
+#dash-input-element {
+color: black;
+}
 .sidebar {
     width: 260px; padding: 16px; background: #12122a;
     min-height: 100vh; position: fixed; overflow-y: auto;
