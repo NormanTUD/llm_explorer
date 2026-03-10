@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """LLM Vector Space Explorer — single-file. Run: python main.py"""
 
+## Let LLM try to estimate directions based on arrows to put on to maybe find meaningful correlations
+
 # ══════════════════════════════════════════════════════════════
 # SECTION 0: THREADING FIX — must be before ANY other imports
 # ══════════════════════════════════════════════════════════════
