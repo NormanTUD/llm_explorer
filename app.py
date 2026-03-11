@@ -15,16 +15,15 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["OPENBLAS_VERBOSE"] = "0"
 
 MODELS = {
-        "gpt2": "GPT-2 (117M)",
-        "gpt2-medium": "GPT-2 Medium (345M)",
-        "distilgpt2": "DistilGPT-2 (82M)",
-        "EleutherAI/pythia-70m": "Pythia 70M",
-        "EleutherAI/pythia-160m": "Pythia 160M",
-        }
+    "gpt2": "GPT-2 (117M)",
+    "gpt2-medium": "GPT-2 Medium (345M)",
+    "distilgpt2": "DistilGPT-2 (82M)",
+    "EleutherAI/pythia-70m": "Pythia 70M",
+    "EleutherAI/pythia-160m": "Pythia 160M",
+}
 
 # ══════════════════════════════════════════════════════════════
 # SECTION 1: VENV BOOTSTRAP
@@ -42,10 +41,10 @@ PY = BIN / ("python.exe" if IS_WIN else "python")
 PIP = BIN / ("pip.exe" if IS_WIN else "pip")
 
 DEPS = [
-        "dash", "plotly", "numpy", "scikit-learn",
-        "torch --index-url https://download.pytorch.org/whl/cpu",
-        "transformers", "umap-learn", "rich",
-        ]
+    "dash", "plotly", "numpy", "scikit-learn",
+    "torch --index-url https://download.pytorch.org/whl/cpu",
+    "transformers", "umap-learn", "rich",
+]
 
 def in_venv():
     return sys.prefix == str(VENV)
@@ -79,9 +78,9 @@ def ensure_venv():
         install_deps()
     else:
         rc = subprocess.call(
-                [str(PY), "-c", "import dash, torch, transformers, sklearn, rich"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
+            [str(PY), "-c", "import dash, torch, transformers, sklearn, rich"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
         if rc != 0:
             install_deps()
 
@@ -117,6 +116,7 @@ con = Console()
 
 _CACHE = {}
 MAX_TOKENS = 5000
+LLM_LABEL_MAX_EXAMPLES = 500  # max examples to send to LLM for labeling
 
 # ── Layer 0: Atomic ──────────────────────────────────────────
 
@@ -164,7 +164,10 @@ def delta_path(path):
 
 # ── Layer 3: Space operations ────────────────────────────────
 
-def reduce(X, n=2, method="pca"):
+def reduce(X, n=2, method="pca", dim_indices=None):
+    """Reduce dimensionality. If dim_indices is provided, only use those dimensions."""
+    if dim_indices is not None and len(dim_indices) > 0:
+        X = X[:, dim_indices]
     if len(X) < 4:
         pad = np.zeros((4, X.shape[1]))
         pad[:len(X)] = X
@@ -231,6 +234,82 @@ def manifold_stats(X, labels):
         out[int(c)] = {"mean": mu, "spread": float(np.mean(np.linalg.norm(pts - mu, axis=1))),
                         "size": len(pts)}
     return out
+
+# ── LLM-based cluster labeling ───────────────────────────────
+
+def llm_label_cluster(model, tok, examples, max_examples=500):
+    """
+    Use the loaded LLM to generate a short label for a cluster
+    by giving it comma-separated examples and asking it to name the group.
+    """
+    import torch
+    # Subsample if too many
+    if len(examples) > max_examples:
+        rng = np.random.default_rng(42)
+        examples = list(rng.choice(examples, max_examples, replace=False))
+
+    # Clean up examples
+    examples = [e.strip() for e in examples if e.strip() and e.strip() != "."]
+    if not examples:
+        return "(empty cluster)"
+
+    example_str = ", ".join(examples[:max_examples])
+    prompt = (
+        f"These words belong to the same group: {example_str}\n"
+        f"A short label for this group is:"
+    )
+
+    input_ids = tok.encode(prompt, return_tensors="pt") if hasattr(tok, '__call__') else torch.tensor([tok.encode(prompt)])
+    if hasattr(tok, '__call__'):
+        input_ids = tok(prompt, return_tensors="pt")["input_ids"]
+    else:
+        input_ids = torch.tensor([tok.encode(prompt)])
+
+    with torch.no_grad():
+        out = model.generate(
+            input_ids,
+            max_new_tokens=20,
+            do_sample=False,
+            temperature=1.0,
+            pad_token_id=tok.eos_token_id,
+        )
+
+    generated = out[0][input_ids.shape[1]:]
+    label = tok.decode(generated, skip_special_tokens=True).strip()
+
+    # Clean: take first line, first sentence, limit length
+    label = label.split("\n")[0].split(".")[0].strip()
+    if len(label) > 60:
+        label = label[:57] + "…"
+    if not label:
+        label = f"({', '.join(examples[:3])}…)"
+
+    return label
+
+
+def llm_label_all_clusters(model, tok, labels, voc, sidx, max_examples=500):
+    """
+    Generate LLM-based labels for all clusters.
+    Returns dict: cluster_id -> label string
+    """
+    cluster_labels = {}
+    unique_clusters = sorted([c for c in np.unique(labels) if c >= 0])
+
+    for cid in unique_clusters:
+        mask = labels == cid
+        gids = sidx[mask] if sidx is not None else np.where(mask)[0]
+        examples = [voc.get(int(i), "?").strip() for i in gids]
+        examples = [e for e in examples if e and e != "?" and e != "."]
+
+        try:
+            label = llm_label_cluster(model, tok, examples, max_examples)
+            cluster_labels[cid] = label
+        except Exception as e:
+            cluster_labels[cid] = f"C{cid} ({len(examples)} tokens)"
+            con.print(f"[yellow]Warning: LLM labeling failed for cluster {cid}: {e}[/yellow]")
+
+    return cluster_labels
+
 
 # ── Layer 4: Comparison ──────────────────────────────────────
 
@@ -300,6 +379,14 @@ def empty_fig(msg="No data yet"):
 # ── Navigation ────────────────────────────────────────────────
 
 def nav_push(stack, entry):
+    # Prevent infinite loops: don't push if same level+id as current
+    cur = nav_current(stack)
+    if (cur.get("level") == entry.get("level") and
+        cur.get("id") == entry.get("id")):
+        return stack
+    # Also limit max depth to prevent runaway navigation
+    if len(stack) >= 20:
+        return stack
     return stack + [entry]
 
 def nav_pop(stack):
@@ -348,11 +435,14 @@ def _lay(fig, title="", h=550):
         hoverlabel=dict(bgcolor="#1a1a2e", font_size=12))
     return fig
 
-def fig_scatter(coords, labels, texts, title=""):
+def fig_scatter(coords, labels, texts, title="", cluster_labels=None):
     fig = go.Figure()
     for c in sorted(np.unique(labels)):
         mask = labels == c
-        name = f"Cluster {c}" if c >= 0 else "Noise"
+        if cluster_labels and c in cluster_labels:
+            name = cluster_labels[c]
+        else:
+            name = f"Cluster {c}" if c >= 0 else "Noise"
         idxs = np.where(mask)[0]
         fig.add_trace(go.Scattergl(
             x=coords[mask, 0], y=coords[mask, 1], mode="markers",
@@ -361,6 +451,27 @@ def fig_scatter(coords, labels, texts, title=""):
             hovertemplate="%{text}<extra>" + name + "</extra>",
             name=name, customdata=idxs.tolist()))
     return _lay(fig, title)
+
+def fig_scatter_3d(coords, labels, texts, title="", cluster_labels=None):
+    fig = go.Figure()
+    for c in sorted(np.unique(labels)):
+        mask = labels == c
+        if cluster_labels and c in cluster_labels:
+            name = cluster_labels[c]
+        else:
+            name = f"Cluster {c}" if c >= 0 else "Noise"
+        idxs = np.where(mask)[0]
+        fig.add_trace(go.Scatter3d(
+            x=coords[mask, 0],
+            y=coords[mask, 1],
+            z=coords[mask, 2],
+            mode="markers",
+            marker=dict(size=3, opacity=0.65),
+            text=[texts[i] for i in idxs],
+            hovertemplate="%{text}<extra>" + name + "</extra>",
+            name=name,
+            customdata=idxs.tolist()))
+    return _lay(fig, title, h=650)
 
 def fig_heatmap(matrix, xl, yl, title=""):
     fig = go.Figure(go.Heatmap(
@@ -396,12 +507,10 @@ def fig_path(points, labels):
     r = reduce(points, n=2, method="pca")
     c = r["coords"]
     fig = go.Figure()
-    # Line trace (background path)
     fig.add_trace(go.Scatter(
         x=c[:, 0], y=c[:, 1], mode="lines",
         line=dict(color="#444", dash="dot", width=1),
         showlegend=False, hoverinfo="skip"))
-    # Arrow markers at each layer
     fig.add_trace(go.Scatter(
         x=c[:, 0], y=c[:, 1], mode="markers+text",
         text=labels, textposition="top center", textfont=dict(size=9, color="#ccc"),
@@ -412,12 +521,10 @@ def fig_path(points, labels):
             line=dict(width=1, color="#fff")),
         hovertemplate="%{text}<extra>Layer %{marker.color}</extra>",
         showlegend=False))
-    # Start marker
     fig.add_trace(go.Scatter(
         x=[c[0, 0]], y=[c[0, 1]], mode="markers",
         marker=dict(size=16, color="#00ff88", symbol="star", line=dict(width=2, color="#000")),
         name="Start", hovertemplate=f"{labels[0]}<extra>Start</extra>"))
-    # End marker
     fig.add_trace(go.Scatter(
         x=[c[-1, 0]], y=[c[-1, 1]], mode="markers",
         marker=dict(size=16, color="#ff4444", symbol="diamond", line=dict(width=2, color="#000")),
@@ -428,117 +535,38 @@ def fig_attn(am, tokens, head=0, title=""):
     m = am[head] if am.ndim == 3 else am
     return fig_heatmap(m, tokens, tokens, title or f"Attention Head {head}")
 
-# ── Render engine ─────────────────────────────────────────────
+# ── Parse dimension range string ─────────────────────────────
 
-def render(E, tokens, meta, n_dims=3, max_tokens=5000,
-           red="umap", clust="kmeans", k=8, search=None, trace=None,
-           plot_type="scatter", layer=None, head=None):
+def parse_dim_range(dim_str, max_dim):
     """
-    Main render pipeline:
-      - subsample up to max_tokens
-      - reduce to n_dims dimensions
-      - cluster
-      - build figures dict
+    Parse a dimension selection string like '0-100,200-300,500' into a list of indices.
+    Supports: individual dims (5), ranges (0-100), comma-separated combos.
+    Returns None if empty/invalid (meaning use all dims).
     """
-    figs = {}
-
-    # ── subsample ──────────────────────────────────────────────
-    n = min(max_tokens, E.shape[0])
-    idxs = sample_indices(E.shape[0], n)
-    Esub = E[idxs]
-    toks = [tokens[i] for i in idxs]
-    met = [meta[i] for i in idxs] if meta is not None else [None] * n
-
-    # ── hover text ─────────────────────────────────────────────
-    hover = []
-    for i, t in enumerate(toks):
-        label = t if len(t) < 40 else t[:37] + "…"
-        hover.append(label)
-
-    # ── reduce ─────────────────────────────────────────────────
-    r = reduce(Esub, n=n_dims, method=red)
-    coords = r["coords"]
-
-    # ── cluster ────────────────────────────────────────────────
-    labs = cluster(Esub, method=clust, k=k)
-
-    # ── title ──────────────────────────────────────────────────
-    title = f"{red.upper()} · {clust} (k={k}) · {n} tokens"
-
-    # ── main scatter (2D or 3D) ────────────────────────────────
-    if n_dims == 3:
-        figs["main"] = fig_scatter_3d(coords, labs, hover, title)
-    else:
-        figs["main"] = fig_scatter(coords, labs, hover, title)
-
-    # ── search highlight ───────────────────────────────────────
-    if search:
-        mask = np.array([search.lower() in t.lower() for t in toks])
-        if mask.any():
-            highlight = np.where(mask)[0]
-            if n_dims == 3:
-                figs["main"].add_trace(go.Scatter3d(
-                    x=coords[highlight, 0],
-                    y=coords[highlight, 1],
-                    z=coords[highlight, 2],
-                    mode="markers",
-                    marker=dict(size=6, color="red", symbol="diamond"),
-                    text=[hover[i] for i in highlight],
-                    hovertemplate="%{text}<extra>Search hit</extra>",
-                    name=f'"{search}"',
-                    customdata=highlight.tolist()))
-            else:
-                figs["main"].add_trace(go.Scatter(
-                    x=coords[highlight, 0],
-                    y=coords[highlight, 1],
-                    mode="markers",
-                    marker=dict(size=10, color="red", symbol="diamond"),
-                    text=[hover[i] for i in highlight],
-                    hovertemplate="%{text}<extra>Search hit</extra>",
-                    name=f'"{search}"',
-                    customdata=highlight.tolist()))
-
-    # ── trace highlight ────────────────────────────────────────
-    if trace:
-        trace_idxs = [i for i, t in enumerate(toks) if trace.lower() in t.lower()]
-        if trace_idxs:
-            trace_idxs = np.array(trace_idxs)
-            if n_dims == 3:
-                figs["main"].add_trace(go.Scatter3d(
-                    x=coords[trace_idxs, 0],
-                    y=coords[trace_idxs, 1],
-                    z=coords[trace_idxs, 2],
-                    mode="markers+lines",
-                    marker=dict(size=5, color="lime"),
-                    line=dict(color="lime", width=2),
-                    text=[hover[i] for i in trace_idxs],
-                    hovertemplate="%{text}<extra>Trace</extra>",
-                    name=f'trace: "{trace}"',
-                    customdata=trace_idxs.tolist()))
-            else:
-                figs["main"].add_trace(go.Scatter(
-                    x=coords[trace_idxs, 0],
-                    y=coords[trace_idxs, 1],
-                    mode="markers+lines",
-                    marker=dict(size=8, color="lime"),
-                    line=dict(color="lime", width=2),
-                    text=[hover[i] for i in trace_idxs],
-                    hovertemplate="%{text}<extra>Trace</extra>",
-                    name=f'trace: "{trace}"',
-                    customdata=trace_idxs.tolist()))
-
-    # ── secondary plots ────────────────────────────────────────
-    if plot_type == "heatmap" and layer is not None and head is not None:
-        figs["secondary"] = fig_attention_heatmap(layer, head, toks)
-    elif plot_type == "bar":
-        figs["secondary"] = fig_cluster_bar(labs, k)
-    elif plot_type == "cosine":
-        figs["secondary"] = fig_cosine_matrix(Esub, toks)
-
-    # ── cluster stats ──────────────────────────────────────────
-    figs["stats"] = cluster_stats(labs, toks)
-
-    return figs
+    if not dim_str or not dim_str.strip():
+        return None
+    indices = set()
+    parts = dim_str.replace(" ", "").split(",")
+    for part in parts:
+        if "-" in part:
+            try:
+                lo, hi = part.split("-", 1)
+                lo, hi = int(lo), int(hi)
+                lo = max(0, lo)
+                hi = min(hi, max_dim - 1)
+                indices.update(range(lo, hi + 1))
+            except ValueError:
+                continue
+        else:
+            try:
+                d = int(part)
+                if 0 <= d < max_dim:
+                    indices.add(d)
+            except ValueError:
+                continue
+    if not indices:
+        return None
+    return sorted(indices)
 
 # ── Layout ────────────────────────────────────────────────────
 
@@ -548,34 +576,36 @@ app.index_string = '''<!DOCTYPE html>
 <html><head>{%metas%}<title>LLM Vector Space Explorer</title>{%css%}<style>
 * { box-sizing: border-box; }
 body { background: #0d0d1a; color: #eee; font-family: 'Segoe UI', system-ui, sans-serif; margin: 0; }
-#dash-input-element {
-color: black;
-}
 .sidebar {
-    width: 260px; padding: 16px; background: #12122a;
-    min-height: 100vh; position: fixed; overflow-y: auto;
+    width: 280px; padding: 16px; background: #12122a;
+    height: 100vh; position: fixed; top: 0; left: 0;
+    overflow-y: auto; overflow-x: hidden;
     border-right: 1px solid #1f1f3a;
+    scrollbar-width: thin;
+    scrollbar-color: #3a3a5a #12122a;
 }
+.sidebar::-webkit-scrollbar { width: 6px; }
+.sidebar::-webkit-scrollbar-track { background: #12122a; }
+.sidebar::-webkit-scrollbar-thumb { background: #3a3a5a; border-radius: 3px; }
+.sidebar::-webkit-scrollbar-thumb:hover { background: #4a4a6a; }
 .sb-section {
     background: #1a1a2e; border-radius: 8px; padding: 10px 12px;
     margin-bottom: 10px; border: 1px solid #252545;
 }
 .sb-section label { font-size: 11px; color: #8888aa; margin-top: 6px; display: block;
     text-transform: uppercase; letter-spacing: 0.5px; }
-.main { margin-left: 280px; padding: 16px 20px; padding-bottom: 40px; }
+.main { margin-left: 300px; padding: 16px 20px; padding-bottom: 40px; }
 input, select {
     background: #1e1e30; color: #f0f0f0; border: 1px solid #3a3a5a;
     border-radius: 6px; padding: 7px 10px; width: 100%; font-size: 13px;
 }
 input:focus { border-color: #4a9eff; outline: none; box-shadow: 0 0 0 2px rgba(74,158,255,0.2); }
 input::placeholder { color: #666; }
-/* Dash dropdown overrides */
 .Select-control, .Select-menu-outer { background: #1e1e30 !important; }
 .Select-value-label, .Select-input input { color: #f0f0f0 !important; }
 .Select-placeholder { color: #666 !important; }
 .VirtualizedSelectOption { background: #1e1e30; color: #f0f0f0; }
 .VirtualizedSelectFocusedOption { background: #3a3a5a !important; }
-input:focus { border-color: #4a9eff; outline: none; }
 button {
     background: #4a9eff; color: #fff; border: none; border-radius: 6px;
     padding: 8px 16px; cursor: pointer; width: 100%; margin: 5px 0;
@@ -604,586 +634,536 @@ button:hover { background: #3a8eef; }
     border: 1px solid #1f1f3a; margin-bottom: 10px;
 }
 .status-bar {
-    position: fixed; bottom: 0; left: 260px; right: 0;
+    position: fixed; bottom: 0; left: 280px; right: 0;
     background: #0a0a18; border-top: 1px solid #1f1f3a;
     padding: 4px 16px; font-size: 11px; color: #555;
     display: flex; justify-content: space-between; z-index: 100;
 }
-.dash-input-element {
-    color: black;
-}
-.sidebar {
-    width: 260px; padding: 16px; background: #12122a;
-    min-height: 100vh; position: fixed; overflow-y: auto;
-    border-right: 1px solid #1f1f3a;
-}
 </style></head><body>{%app_entry%}{%config%}{%scripts%}{%renderer%}</body></html>'''
 
-def _sec(title, children):
-    return html.Div(className="sb-section", children=[
-        html.Div(title, style={"fontSize": "12px", "fontWeight": "700",
-                                "color": "#6a6a9a", "marginBottom": "6px"}),
-        *children])
+# ── Layout (continued) ───────────────────────────────────────
 
-sidebar = html.Div(className="sidebar", children=[
-    html.H3("🔬 LLM Explorer", style={"margin": "0 0 4px", "fontSize": "18px"}),
-    html.Div("Vector Space Interpretability", style={"fontSize": "10px", "color": "#555",
-              "marginBottom": "14px", "letterSpacing": "1px", "textTransform": "uppercase"}),
+app.layout = html.Div([
+    # ── Stores ──
+    dcc.Store(id="nav-stack", data=json.dumps(init_stack(DEFAULT_MODEL))),
+    dcc.Store(id="cache-key", data=""),
+    dcc.Store(id="cluster-labels-store", data="{}"),
 
-    _sec("Model", [
-        html.Label("Select model"),
-        dcc.Dropdown(id="model-sel",
-            options=[{"label": v, "value": k} for k, v in MODELS.items()],
-            value=DEFAULT_MODEL, clearable=False,
-            style={"background": "#2a2a3a", "color": "#000", "fontSize": "12px"}),
-    ]),
-    _sec("Visualization", [
-        html.Label("Plot type"),
-        dcc.RadioItems(id="viz-type",
-            options=[{"label": v, "value": k} for k, v in
-                     {"scatter": "Scatter", "heatmap": "Heatmap",
-                      "parallel": "Parallel", "radar": "Radar", "bars": "Bars"}.items()],
-            value=DEFAULT_VIZ, style={"fontSize": "12px"},
-            labelStyle={"display": "block", "padding": "2px 0"}),
-        html.Label("Reduction"),
-        dcc.RadioItems(id="reduce-method",
-            options=[{"label": v, "value": k} for k, v in
-                     {"pca": "PCA", "umap": "UMAP", "tsne": "t-SNE"}.items()],
-            value=DEFAULT_REDUCE, style={"fontSize": "12px"},
-            labelStyle={"display": "inline-block", "marginRight": "12px"}),
-        html.Label("Clusters (k)"),
-        dcc.Slider(id="k-slider", min=3, max=30, step=1, value=DEFAULT_K,
-                   marks={i: str(i) for i in [3, 8, 12, 20, 30]},
-                   tooltip={"placement": "bottom"}),
-    ]),
-    _sec("Search", [
-        html.Label("Find token"),
-        dcc.Input(id="search-box", placeholder="type a word...", debounce=True),
-        html.Button("Search", id="search-btn", n_clicks=0),
-        html.Div(id="search-results", style={"fontSize": "11px", "color": "#8888aa",
-                  "marginTop": "4px", "maxHeight": "80px", "overflowY": "auto"}),
-    ]),
-    _sec("Trace & Attention", [
-        html.Label("Input text"),
-        dcc.Input(id="trace-box", placeholder="The cat sat on", debounce=True),
-        html.Div(style={"display": "flex", "gap": "4px"}, children=[
-            html.Button("Trace", id="trace-btn", n_clicks=0, style={"flex": "1"}),
-            html.Button("Attention", id="attn-btn", n_clicks=0, style={"flex": "1"}),
-        ]),
-        html.Label("Token position"),
-        dcc.Slider(id="trace-pos", min=0, max=20, step=1, value=0,
-                   marks=None, tooltip={"placement": "bottom"}),
-        html.Label("Layer"),
-        dcc.Slider(id="attn-layer", min=0, max=11, step=1, value=0,
-                   marks=None, tooltip={"placement": "bottom"}),
-        html.Label("Head"),
-        dcc.Slider(id="attn-head", min=0, max=11, step=1, value=0,
-                   marks=None, tooltip={"placement": "bottom"}),
-    ]),
-    _sec("Visualization", [
-        html.Label("Max tokens"),
-        dcc.Slider(id="max-tokens-slider", min=1000, max=20000, step=1000, value=5000,
-                   marks={1000: "1k", 5000: "5k", 10000: "10k", 20000: "20k"},
-                   tooltip={"placement": "bottom"}),
-        html.Label("Plot type"),
-        # ... rest stays the same
-        ]),
-    html.Label("Dimensions"),
-    dcc.RadioItems(id="n-dims",
-        options=[{"label": "2D", "value": 2}, {"label": "3D", "value": 3}],
-        value=3,  # default to 3D
-        style={"fontSize": "12px"},
-        labelStyle={"display": "inline-block", "marginRight": "12px"}),
+    # ── Sidebar ──
+    html.Div([
+        html.H3("🔬 LLM Explorer", style={"margin": "0 0 12px", "fontSize": "18px",
+                                            "background": "linear-gradient(90deg,#4a9eff,#a855f7)",
+                                            "WebkitBackgroundClip": "text",
+                                            "WebkitTextFillColor": "transparent"}),
 
-    _sec("Compare", [
-        html.Label("Comma-separated tokens"),
-        dcc.Input(id="compare-box", placeholder="king,queen,man,woman", debounce=True),
-        html.Button("Compare", id="compare-btn", n_clicks=0),
-    ]),
-    html.Button("Back", id="back-btn", n_clicks=0, className="btn-secondary",
-                style={"marginTop": "8px"}),
+        html.Div([
+            html.Label("Model"),
+            dcc.Dropdown(id="model-sel",
+                         options=[{"label": v, "value": k} for k, v in MODELS.items()],
+                         value=DEFAULT_MODEL, clearable=False,
+                         style={"background": "#1e1e30", "color": "#f0f0f0"}),
+        ], className="sb-section"),
+
+        html.Div([
+            html.Label("Reduction"),
+            dcc.Dropdown(id="reduce-sel",
+                         options=[{"label": m.upper(), "value": m} for m in ["pca", "umap", "tsne"]],
+                         value=DEFAULT_REDUCE, clearable=False,
+                         style={"background": "#1e1e30"}),
+            html.Label("Clusters (k)"),
+            dcc.Slider(id="k-slider", min=2, max=30, step=1, value=DEFAULT_K,
+                       marks={i: str(i) for i in range(2, 31, 4)},
+                       tooltip={"placement": "bottom"}),
+            html.Label("Viz Type"),
+            dcc.Dropdown(id="viz-sel",
+                         options=[{"label": l, "value": v} for v, l in
+                                  [("scatter", "2D Scatter"), ("scatter3d", "3D Scatter"),
+                                   ("heatmap", "Heatmap"), ("parallel", "Parallel Coords")]],
+                         value=DEFAULT_VIZ, clearable=False,
+                         style={"background": "#1e1e30"}),
+        ], className="sb-section"),
+
+        html.Div([
+            html.Label("Dimension Selection"),
+            html.P("e.g. 0-100,200-300,500", style={"fontSize": "10px", "color": "#666", "margin": "2px 0"}),
+            dcc.Input(id="dim-range-input", type="text", placeholder="all (leave empty)",
+                      debounce=True, style={"marginBottom": "4px"}),
+            html.Div(id="dim-range-info", style={"fontSize": "11px", "color": "#8888aa"}),
+        ], className="sb-section"),
+
+        html.Div([
+            html.Label("LLM Cluster Labels"),
+            html.P("Max examples per cluster:", style={"fontSize": "10px", "color": "#666", "margin": "2px 0"}),
+            dcc.Input(id="llm-label-max", type="number", value=LLM_LABEL_MAX_EXAMPLES,
+                      min=10, max=2000, step=10, style={"marginBottom": "4px"}),
+            html.Button("Generate LLM Labels", id="btn-llm-labels", className="btn-secondary"),
+            html.Div(id="llm-label-status", style={"fontSize": "11px", "color": "#8888aa", "marginTop": "4px"}),
+        ], className="sb-section"),
+
+        html.Div([
+            html.Label("Search"),
+            dcc.Input(id="search-box", type="text", placeholder="token…", debounce=True),
+        ], className="sb-section"),
+
+        html.Div([
+            html.Label("Trace / Compare"),
+            dcc.Input(id="trace-input", type="text", placeholder="sentence…", debounce=True),
+            dcc.Input(id="compare-input", type="text", placeholder="word1, word2, …", debounce=True),
+        ], className="sb-section"),
+
+        html.Div([
+            html.Button("🔄 Reload", id="btn-reload"),
+            html.Button("⬅ Back", id="btn-back", className="btn-secondary"),
+        ], className="sb-section"),
+
+    ], className="sidebar"),
+
+    # ── Main ──
+    html.Div([
+        html.Div(id="crumb-bar", className="crumb-bar"),
+        html.Div(id="math-panel", className="math-panel"),
+        html.Div(id="info-panel", className="info-panel"),
+        html.Div(dcc.Graph(id="main-plot", figure=empty_fig(), config={"scrollZoom": True}),
+                 className="plot-card"),
+        html.Div(dcc.Graph(id="detail-plot", figure=empty_fig("Detail view"), config={"scrollZoom": True}),
+                 className="plot-card"),
+        html.Div(dcc.Graph(id="aux-plot", figure=empty_fig("Auxiliary"), config={"scrollZoom": True}),
+                 className="plot-card"),
+        html.Div(id="status-bar", className="status-bar"),
+    ], className="main"),
 ])
-
-def fig_scatter_3d(coords, labels, texts, title=""):
-    fig = go.Figure()
-    for c in sorted(np.unique(labels)):
-        mask = labels == c
-        name = f"Cluster {c}" if c >= 0 else "Noise"
-        idxs = np.where(mask)[0]
-        fig.add_trace(go.Scatter3d(
-            x=coords[mask, 0],
-            y=coords[mask, 1],
-            z=coords[mask, 2],
-            mode="markers",
-            marker=dict(size=3, opacity=0.65),
-            text=[texts[i] for i in idxs],
-            hovertemplate="%{text}<extra>" + name + "</extra>",
-            name=name,
-            customdata=idxs.tolist()))
-    return _lay(fig, title, h=650)
-
-main_area = html.Div(className="main", children=[
-    html.Div(className="crumb-bar", children=[
-        html.Div(id="breadcrumbs", style={"display": "flex", "alignItems": "center",
-                                            "gap": "2px", "flexWrap": "wrap"}),
-        html.Span(id="depth-tag", style={"marginLeft": "auto", "fontSize": "11px",
-                                          "color": "#666", "background": "#1a1a2e",
-                                          "padding": "2px 8px", "borderRadius": "4px"}),
-    ]),
-    dcc.Markdown(id="math-panel", className="math-panel", mathjax=True,
-                 style={"minHeight": "30px"}),
-    html.Div(id="info-panel", className="info-panel", style={"display": "none"}),
-    html.Div(className="plot-card", children=[
-        dcc.Loading(type="circle", color="#4a9eff", children=[
-            dcc.Graph(id="main-plot", config={"scrollZoom": True}),
-        ])
-    ]),
-    html.Div(style={"display": "flex", "gap": "10px"}, children=[
-        html.Div(className="plot-card", style={"flex": "1"}, children=[
-            dcc.Loading(type="dot", color="#4a9eff", children=[
-                dcc.Graph(id="detail-plot")])]),
-        html.Div(className="plot-card", style={"flex": "1"}, children=[
-            dcc.Loading(type="dot", color="#4a9eff", children=[
-                dcc.Graph(id="bars-plot")])]),
-    ]),
-    dcc.Store(id="nav-store", data=json.dumps(init_stack(DEFAULT_MODEL))),
-    html.Div(className="status-bar", children=[
-        html.Span(id="status-left", children="Loading..."),
-        html.Span(id="status-right", children="LLM Vector Space Explorer v0.1"),
-    ]),
-])
-
-app.layout = html.Div([sidebar, main_area])
-
-# ── Callback ──────────────────────────────────────────────────
-
-@callback(
-    Output("nav-store", "data"),
-    Output("main-plot", "figure"),
-    Output("detail-plot", "figure"),
-    Output("bars-plot", "figure"),
-    Output("breadcrumbs", "children"),
-    Output("depth-tag", "children"),
-    Output("math-panel", "children"),
-    Output("info-panel", "children"),
-    Output("info-panel", "style"),
-    Output("search-results", "children"),
-    Output("status-left", "children"),
-    Output("attn-layer", "max"),
-    Output("attn-head", "max"),
-    Output("trace-pos", "max"),
-    # Triggers
-    Input("main-plot", "clickData"),
-    Input("back-btn", "n_clicks"),
-    Input("search-btn", "n_clicks"),
-    Input("trace-btn", "n_clicks"),
-    Input("attn-btn", "n_clicks"),
-    Input("compare-btn", "n_clicks"),
-    Input("model-sel", "value"),
-    Input("viz-type", "value"),
-    Input("reduce-method", "value"),
-    Input("k-slider", "value"),
-    Input("attn-layer", "value"),
-    Input("attn-head", "value"),
-    Input("trace-pos", "value"),
-    Input("max-tokens-slider", "value"),
-    Input("n-dims", "value"),
-    # State
-    State("nav-store", "data"),
-    State("search-box", "value"),
-    State("trace-box", "value"),
-    State("compare-box", "value"),
-    prevent_initial_call=False,
-)
-def master_cb(click, back_n, search_n, trace_n, attn_n, compare_n,
-              model_name, viz, red, k, a_layer, a_head, t_pos,
-              max_tokens_val, n_dims_val,
-              nav_json, search_q, trace_txt, compare_txt):
-
-    mn = model_name or DEFAULT_MODEL
-    stack = json.loads(nav_json) if nav_json else init_stack(mn)
-    triggered = ctx.triggered_id or "init"
-    search_res = no_update
-
-    mdl, tok = load(mn)
-    E = embed_matrix(mdl)
-    voc = vocab(con, tok)
-
-    mx_layer = n_layers(mdl) - 1
-    mx_head = n_heads(mdl) - 1
-    mx_trace = 20
-
-    max_tok = max_tokens_val or MAX_TOKENS
-    ndims = n_dims_val or 3
-    red = red or DEFAULT_REDUCE
-    k = k or DEFAULT_K
-    viz = viz or DEFAULT_VIZ
-
-    # ── Nav triggers ──────────────────────────────────────────
-    if triggered == "model-sel":
-        stack = init_stack(mn)
-        con.print(f"[bold cyan]Switching to {mn}...[/bold cyan]")
-
-    elif triggered == "back-btn":
-        stack = nav_pop(stack)
-
-    elif triggered == "main-plot" and click:
-        pt = click["points"][0]
-        cur = nav_current(stack)
-        if cur["level"] == "model":
-            sidx = sample_indices(E.shape[0], min(max_tok, E.shape[0]))
-            labs = cluster(E[sidx], k=k)
-            ci = pt.get("customdata", pt.get("pointIndex", 0))
-            cid = int(labs[int(ci)])
-            gids = sidx[labs == cid]
-            ex = [voc.get(int(i), "?").strip() or "." for i in gids[:5]]
-            stack = nav_push(stack, {"level": "cluster", "id": cid,
-                "label": f"C{cid}: {', '.join(ex)}"})
-        elif cur["level"] == "cluster":
-            cid = cur["id"]
-            sidx = sample_indices(E.shape[0], min(max_tok, E.shape[0]))
-            labs = cluster(E[sidx], k=k)
-            mask = np.where(labs == cid)[0]
-            li = int(pt.get("customdata", pt.get("pointIndex", 0)))
-            gid = int(sidx[mask[li]]) if li < len(mask) else int(sidx[mask[0]])
-            stack = nav_push(stack, {"level": "token", "id": gid,
-                "label": f"'{voc.get(gid, '?').strip()}'"})
-        elif cur["level"] == "token":
-            nbr_idx, _ = neighbors(E, cur["id"], 30)
-            ai = np.concatenate([[cur["id"]], nbr_idx])
-            li = int(pt.get("customdata", pt.get("pointIndex", 0)))
-            ntid = int(ai[li]) if li < len(ai) else cur["id"]
-            stack = nav_push(stack, {"level": "token", "id": ntid,
-                "label": f"'{voc.get(ntid, '?').strip()}'"})
-
-    elif triggered == "search-btn" and search_q:
-        res = search(E, voc, search_q, tok)
-        if res:
-            stack = nav_push(stack, {"level": "token", "id": res[0][0],
-                "label": f"'{voc.get(res[0][0], '?').strip()}'"})
-            search_res = [html.Div(f"{r[2].strip()} ({r[1]:.3f})",
-                          style={"padding": "1px 0"}) for r in res[:8]]
-        else:
-            search_res = [html.Div("No results", style={"color": "#f88"})]
-
-    elif triggered == "trace-btn" and trace_txt:
-        tids = token_ids(tok, trace_txt)
-        mx_trace = max(len(tids) - 1, 0)
-        stack = nav_push(stack, {"level": "trace", "id": trace_txt,
-            "label": f"Trace: '{trace_txt[:20]}'"})
-
-    elif triggered == "attn-btn" and trace_txt:
-        stack = nav_push(stack, {"level": "attention", "id": trace_txt,
-            "label": f"Attn: '{trace_txt[:20]}'"})
-
-    elif triggered == "compare-btn" and compare_txt:
-        ws = [w.strip() for w in compare_txt.split(",") if w.strip()]
-        ids = [tok.encode(w)[0] for w in ws if tok.encode(w)]
-        if len(ids) >= 2:
-            lb = [voc.get(i, "?").strip() for i in ids]
-            stack = nav_push(stack, {"level": "compare", "ids": ids,
-                "label": f"Compare: {', '.join(lb[:4])}"})
-
-    cur = nav_current(stack)
-    if cur.get("level") == "trace" and trace_txt:
-        mx_trace = max(len(token_ids(tok, trace_txt)) - 1, 0)
-
-    # ── Render per level ──────────────────────────────────────
-    level = cur.get("level", "model")
-    main_fig = empty_fig()
-    detail_fig = empty_fig()
-    bars_fig = empty_fig()
-    tex = ""
-    info = ""
-
-    # Build full token list for the vocabulary
-    all_tokens = [voc.get(i, "?").strip() or "." for i in range(E.shape[0])]
-
-    if level == "model":
-        # ── Model overview: scatter of sampled embeddings ─────
-        n = min(max_tok, E.shape[0])
-        sidx = sample_indices(E.shape[0], n)
-        Esub = E[sidx]
-        toks = [all_tokens[i] for i in sidx]
-
-        r = reduce(Esub, n=ndims, method=red)
-        coords = r["coords"]
-        labs = cluster(Esub, method="kmeans", k=k)
-        title = f"{red.upper()} · kmeans (k={k}) · {n} tokens"
-
-        # Hover text
-        hover = [t if len(t) < 40 else t[:37] + "…" for t in toks]
-
-        # Main scatter
-        if ndims == 3:
-            main_fig = fig_scatter_3d(coords, labs, hover, title)
-        else:
-            main_fig = fig_scatter(coords, labs, hover, title)
-
-        # Search highlight
-        if search_q and triggered == "search-btn":
-            smask = np.array([search_q.lower() in t.lower() for t in toks])
-            if smask.any():
-                hi = np.where(smask)[0]
-                if ndims == 3:
-                    main_fig.add_trace(go.Scatter3d(
-                        x=coords[hi, 0], y=coords[hi, 1], z=coords[hi, 2],
-                        mode="markers",
-                        marker=dict(size=6, color="red", symbol="diamond"),
-                        text=[hover[i] for i in hi],
-                        hovertemplate="%{text}<extra>Search hit</extra>",
-                        name=f'"{search_q}"', customdata=hi.tolist()))
-                else:
-                    main_fig.add_trace(go.Scatter(
-                        x=coords[hi, 0], y=coords[hi, 1],
-                        mode="markers",
-                        marker=dict(size=10, color="red", symbol="diamond"),
-                        text=[hover[i] for i in hi],
-                        hovertemplate="%{text}<extra>Search hit</extra>",
-                        name=f'"{search_q}"', customdata=hi.tolist()))
-
-        # Trace highlight
-        if trace_txt:
-            tidxs = [i for i, t in enumerate(toks) if trace_txt.lower() in t.lower()]
-            if tidxs:
-                tidxs = np.array(tidxs)
-                if ndims == 3:
-                    main_fig.add_trace(go.Scatter3d(
-                        x=coords[tidxs, 0], y=coords[tidxs, 1], z=coords[tidxs, 2],
-                        mode="markers+lines",
-                        marker=dict(size=5, color="lime"),
-                        line=dict(color="lime", width=2),
-                        text=[hover[i] for i in tidxs],
-                        hovertemplate="%{text}<extra>Trace</extra>",
-                        name=f'trace: "{trace_txt}"', customdata=tidxs.tolist()))
-                else:
-                    main_fig.add_trace(go.Scatter(
-                        x=coords[tidxs, 0], y=coords[tidxs, 1],
-                        mode="markers+lines",
-                        marker=dict(size=8, color="lime"),
-                        line=dict(color="lime", width=2),
-                        text=[hover[i] for i in tidxs],
-                        hovertemplate="%{text}<extra>Trace</extra>",
-                        name=f'trace: "{trace_txt}"', customdata=tidxs.tolist()))
-
-        # Detail: cluster size bar chart
-        unique, counts = np.unique(labs, return_counts=True)
-        detail_fig = _lay(go.Figure(go.Bar(
-            x=[f"C{c}" for c in unique], y=counts,
-            marker_color=px.colors.qualitative.Plotly[:len(unique)]
-        )), f"Cluster sizes (k={k})", 300)
-
-        # Bars: PCA variance or top dims
-        if "variance" in r.get("info", {}):
-            var = r["info"]["variance"]
-            bars_fig = _lay(go.Figure(go.Bar(
-                x=[f"PC{i+1}" for i in range(len(var))], y=var,
-                marker_color="#4a9eff"
-            )), "PCA Explained Variance", 300)
-        else:
-            # Show norm distribution
-            norms = np.linalg.norm(Esub, axis=1)
-            bars_fig = _lay(go.Figure(go.Histogram(
-                x=norms, nbinsx=50, marker_color="#4a9eff"
-            )), "Embedding Norm Distribution", 300)
-
-        tex = tex_overview(E, n_sampled=n)
-        ms = manifold_stats(Esub, labs)
-        summ = cluster_summary(labs, {i: toks[i] for i in range(len(toks))}, n=6)
-        info_lines = []
-        for cid_s in sorted(ms.keys()):
-            ex = summ.get(cid_s, [])
-            info_lines.append(f"**C{cid_s}** (n={ms[cid_s]['size']}, "
-                              f"spread={ms[cid_s]['spread']:.3f}): "
-                              f"{', '.join(ex[:6])}")
-        info = "\n\n".join(info_lines)
-
-    elif level == "cluster":
-        # ── Cluster drill-down ────────────────────────────────
-        cid = cur["id"]
-        sidx = sample_indices(E.shape[0], min(max_tok, E.shape[0]))
-        labs = cluster(E[sidx], k=k)
-        mask = labs == cid
-        gids = sidx[mask]
-
-        if len(gids) < 2:
-            main_fig = empty_fig(f"Cluster {cid} has < 2 tokens")
-        else:
-            Csub = E[gids]
-            ctoks = [all_tokens[i] for i in gids]
-            hover = [t if len(t) < 40 else t[:37] + "…" for t in ctoks]
-            r = reduce(Csub, n=ndims, method=red)
-            coords = r["coords"]
-            sub_labs = cluster(Csub, method="kmeans", k=min(k, len(gids) - 1))
-            title = f"Cluster {cid} · {len(gids)} tokens"
-
-            if ndims == 3:
-                main_fig = fig_scatter_3d(coords, sub_labs, hover, title)
-            else:
-                main_fig = fig_scatter(coords, sub_labs, hover, title)
-
-        # Detail: norms within cluster
-        if len(gids) >= 2:
-            norms = np.linalg.norm(E[gids], axis=1)
-            detail_fig = _lay(go.Figure(go.Histogram(
-                x=norms, nbinsx=30, marker_color="#4a9eff"
-            )), f"Norm distribution C{cid}", 300)
-
-        tex = tex_cluster(manifold_stats(E[sidx], labs), cid)
-        info = f"Cluster {cid}: {len(gids)} tokens"
-
-    elif level == "token":
-        # ── Token neighborhood ────────────────────────────────
-        tid = cur["id"]
-        vec = E[tid]
-        nbr_idx, nbr_sims = neighbors(E, tid, 30)
-        ai = np.concatenate([[tid], nbr_idx])
-        Nsub = E[ai]
-        ntoks = [all_tokens[i] for i in ai]
-        hover = [f"{'→ ' if i == 0 else ''}{t}" for i, t in enumerate(ntoks)]
-
-        r = reduce(Nsub, n=min(ndims, Nsub.shape[0] - 1), method=red)
-        coords = r["coords"]
-        labs_n = np.zeros(len(ai), dtype=int)
-        labs_n[0] = 1  # highlight the target token
-
-        actual_dims = coords.shape[1]
-        if actual_dims == 3:
-            main_fig = fig_scatter_3d(coords, labs_n, hover,
-                                      f"Neighbors of '{all_tokens[tid].strip()}'")
-        else:
-            main_fig = fig_scatter(coords, labs_n, hover,
-                                   f"Neighbors of '{all_tokens[tid].strip()}'")
-
-        # Detail: similarity bar
-        detail_fig = _lay(go.Figure(go.Bar(
-            x=[all_tokens[i].strip() for i in nbr_idx[:15]],
-            y=nbr_sims[:15], marker_color="#4a9eff"
-        )), "Cosine Similarity to Neighbors", 300)
-
-        # Bars: raw dimensions
-        bars_fig = fig_bars(vec, f"Dimensions of '{all_tokens[tid].strip()}'")
-
-        tex = tex_token(vec)
-        info = (f"Token #{tid}: **{all_tokens[tid].strip()}**\n\n"
-                f"Top neighbors: " +
-                ", ".join(f"{all_tokens[int(i)].strip()} ({s:.3f})"
-                          for i, s in zip(nbr_idx[:10], nbr_sims[:10])))
-
-    elif level == "trace":
-        # ── Token trace through layers ────────────────────────
-        text = cur["id"]
-        acts = activations(mdl, tok, text)
-        tids = token_ids(tok, text)
-        tp = min(t_pos or 0, len(tids) - 1)
-        mx_trace = max(len(tids) - 1, 0)
-
-        path = token_path(acts, tp)
-        layer_labels = [f"L{i}" for i in range(len(path))]
-        main_fig = fig_path(path, layer_labels)
-
-        # Detail: delta norms
-        dp = delta_path(path)
-        dnorms = np.linalg.norm(dp, axis=1)
-        detail_fig = _lay(go.Figure(go.Bar(
-            x=[f"L{i}→L{i+1}" for i in range(len(dnorms))],
-            y=dnorms, marker_color="#ff6b6b"
-        )), "Layer-to-layer delta norms", 300)
-
-        # Bars: final layer dims
-        bars_fig = fig_bars(path[-1], f"Final layer embedding (pos {tp})")
-
-        tok_str = tok.decode([tids[tp]]) if tp < len(tids) else "?"
-        tex = tex_delta()
-        info = (f"Tracing **'{text}'** — token position {tp}: **{tok_str}**\n\n"
-                f"Path through {len(acts)} layers, "
-                f"max Δ = {dnorms.max():.3f} at L{dnorms.argmax()}→L{dnorms.argmax()+1}")
-
-    elif level == "attention":
-        # ── Attention heatmap ─────────────────────────────────
-        text = cur["id"]
-        am = attn_maps(mdl, tok, text)
-        tids = token_ids(tok, text)
-        tok_strs = [tok.decode([t]) for t in tids]
-        layer = min(a_layer or 0, mx_layer)
-        head_i = min(a_head or 0, mx_head)
-
-        if layer in am:
-            main_fig = fig_attn(am[layer], tok_strs, head=head_i,
-                                title=f"Attention L{layer} H{head_i}")
-        else:
-            main_fig = empty_fig(f"Layer {layer} not available")
-
-        # Detail: attention entropy per head
-        if layer in am:
-            a = am[layer]  # shape: (heads, seq, seq)
-            entropies = []
-            for h in range(a.shape[0]):
-                p = a[h].flatten() + 1e-12
-                entropies.append(float(-np.sum(p * np.log(p))))
-            detail_fig = _lay(go.Figure(go.Bar(
-                x=[f"H{i}" for i in range(len(entropies))],
-                y=entropies,
-                marker_color=["#4a9eff" if i != head_i else "#ff6b6b"
-                               for i in range(len(entropies))]
-            )), f"Attention entropy L{layer}", 300)
-
-        tex = f"\\text{{Attention}}(Q,K,V) = \\text{{softmax}}\\left(\\frac{{QK^T}}{{\\sqrt{{d_k}}}}\\right)V"
-        info = f"Attention for **'{text}'** — Layer {layer}, Head {head_i}, {len(tok_strs)} tokens"
-
-    elif level == "compare":
-        # ── Token comparison ──────────────────────────────────
-        ids = cur.get("ids", [])
-        if len(ids) >= 2:
-            cm = compare_tokens(E, ids)
-            lb = [all_tokens[i].strip() for i in ids]
-            main_fig = fig_heatmap(cm, lb, lb, "Cosine Similarity Matrix")
-
-            # Detail: shared dimensions
-            sd = shared_dims(E, ids, 20)
-            vals = np.abs(E[ids].mean(0))[sd]
-            detail_fig = _lay(go.Figure(go.Bar(
-                x=[f"d{d}" for d in sd], y=vals, marker_color="#4a9eff"
-            )), "Shared high-activation dims", 300)
-
-            # Bars: outlier dims for first token
-            od = outlier_dims(E[ids[0]], E, 20)
-            bars_fig = _lay(go.Figure(go.Bar(
-                x=[f"d{d}" for d in od],
-                y=np.abs(E[ids[0]] - E.mean(0))[od] / (E.std(0)[od] + 1e-9),
-                marker_color="#ff6b6b"
-            )), f"Outlier dims: {lb[0]}", 300)
-
-            tex = f"\\cos(\\mathbf{{v}}_i, \\mathbf{{v}}_j) = \\frac{{\\mathbf{{v}}_i \\cdot \\mathbf{{v}}_j}}{{\\|\\mathbf{{v}}_i\\| \\|\\mathbf{{v}}_j\\|}}"
-            info = f"Comparing: {', '.join(lb)}"
-        else:
-            main_fig = empty_fig("Need at least 2 tokens to compare")
-
-    # ── Assemble output ───────────────────────────────────────
-    math_str = f"$${tex}$$" if tex else ""
-    status = f"{mn} | {E.shape[0]} tok × {E.shape[1]}d | {level}"
-    info_style = {"display": "block"} if info else {"display": "none"}
-
-    return (json.dumps(stack),
-            main_fig, detail_fig, bars_fig,
-            nav_crumbs(stack), level_label(stack), math_str,
-            dcc.Markdown(info) if info else "", info_style,
-            search_res, status,
-            mx_layer, mx_head, mx_trace)
 
 # ══════════════════════════════════════════════════════════════
-# RUN
+# SECTION 4: CALLBACKS
+# ══════════════════════════════════════════════════════════════
+
+def _load(mn):
+    """Load model, tokenizer, embeddings — cached."""
+    if mn in _CACHE:
+        return _CACHE[mn]
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    import torch
+    con.print(f"[cyan]Loading {mn}…[/cyan]")
+    tok = AutoTokenizer.from_pretrained(mn)
+    model = AutoModelForCausalLM.from_pretrained(mn, output_hidden_states=True, output_attentions=True)
+    model.eval()
+    E = model.get_input_embeddings().weight.detach().cpu().numpy()
+    voc = {i: tok.decode([i]) for i in range(len(E))}
+    con.print(f"[green]✓ {mn}: {E.shape[0]} tokens × {E.shape[1]} dims[/green]")
+    _CACHE[mn] = (model, tok, E, voc)
+    return model, tok, E, voc
+
+
+def _compute(mn, method, k, dim_str, cluster_labels_json):
+    """Compute reduction + clustering on sampled tokens."""
+    model, tok, E, voc = _load(mn)
+    V, d = E.shape
+    n = min(V, MAX_TOKENS)
+    rng = np.random.default_rng(42)
+    sidx = rng.choice(V, n, replace=False) if n < V else np.arange(V)
+    sidx.sort()
+    X = E[sidx]
+
+    # Parse dimension selection
+    dim_indices = parse_dim_range(dim_str, d)
+
+    # Reduce — for 3D scatter, request 3 components
+    n_components = 3 if True else 2  # always compute 3 so we can switch
+    r = reduce(X, n=3, method=method, dim_indices=dim_indices)
+    coords3 = r["coords"][:n, :3] if r["coords"].shape[1] >= 3 else np.column_stack(
+        [r["coords"][:n], np.zeros(n)])
+    coords2 = coords3[:, :2]
+
+    # Cluster on the original (optionally dim-selected) space
+    X_for_cluster = X[:, dim_indices] if dim_indices else X
+    labels = cluster(X_for_cluster, k=k)
+    texts = [voc.get(int(i), "?") for i in sidx]
+
+    # Load existing cluster labels
+    try:
+        cl = json.loads(cluster_labels_json) if cluster_labels_json else {}
+        cl = {int(k2): v2 for k2, v2 in cl.items()}
+    except Exception:
+        cl = {}
+
+    return model, tok, E, voc, sidx, X, coords2, coords3, labels, texts, r, dim_indices, cl
+
+
+# ── Dim range info callback ──────────────────────────────────
+
+@app.callback(
+    Output("dim-range-info", "children"),
+    Input("dim-range-input", "value"),
+    State("model-sel", "value"),
+)
+def update_dim_info(dim_str, mn):
+    if not mn:
+        return ""
+    try:
+        _, _, E, _ = _load(mn)
+        d = E.shape[1]
+        indices = parse_dim_range(dim_str, d)
+        if indices is None:
+            return f"Using all {d} dimensions"
+        return f"Using {len(indices)} of {d} dimensions"
+    except Exception:
+        return ""
+
+
+# ── LLM label generation callback ────────────────────────────
+
+@app.callback(
+    Output("cluster-labels-store", "data"),
+    Output("llm-label-status", "children"),
+    Input("btn-llm-labels", "n_clicks"),
+    State("model-sel", "value"),
+    State("reduce-sel", "value"),
+    State("k-slider", "value"),
+    State("dim-range-input", "value"),
+    State("llm-label-max", "value"),
+    State("cluster-labels-store", "data"),
+    prevent_initial_call=True,
+)
+def generate_llm_labels(n_clicks, mn, method, k, dim_str, max_ex, existing_labels):
+    if not n_clicks or not mn:
+        return no_update, no_update
+
+    max_ex = max_ex or LLM_LABEL_MAX_EXAMPLES
+
+    try:
+        model, tok, E, voc, sidx, X, *_ = _compute(mn, method, k, dim_str, existing_labels)
+
+        # Re-cluster to get labels
+        dim_indices = parse_dim_range(dim_str, E.shape[1])
+        X_for_cluster = X[:, dim_indices] if dim_indices else X
+        labels = cluster(X_for_cluster, k=k)
+
+        con.print(f"[cyan]Generating LLM labels for {len(np.unique(labels))} clusters…[/cyan]")
+        cl = llm_label_all_clusters(model, tok, labels, voc, sidx, max_examples=max_ex)
+        con.print(f"[green]✓ Generated {len(cl)} cluster labels[/green]")
+
+        return json.dumps({str(k2): v2 for k2, v2 in cl.items()}), f"✓ {len(cl)} labels generated"
+
+    except Exception as e:
+        con.print(f"[red]LLM labeling error: {e}[/red]")
+        return no_update, f"Error: {str(e)[:80]}"
+
+
+# ── Master callback ──────────────────────────────────────────
+
+@app.callback(
+    Output("main-plot", "figure"),
+    Output("detail-plot", "figure"),
+    Output("aux-plot", "figure"),
+    Output("crumb-bar", "children"),
+    Output("math-panel", "children"),
+    Output("info-panel", "children"),
+    Output("nav-stack", "data"),
+    Output("status-bar", "children"),
+    # Inputs
+    Input("btn-reload", "n_clicks"),
+    Input("btn-back", "n_clicks"),
+    Input("main-plot", "clickData"),
+    Input("search-box", "value"),
+    Input("trace-input", "value"),
+    Input("compare-input", "value"),
+    Input("model-sel", "value"),
+    Input("reduce-sel", "value"),
+    Input("k-slider", "value"),
+    Input("viz-sel", "value"),
+    Input("dim-range-input", "value"),
+    Input("cluster-labels-store", "data"),
+    # State
+    State("nav-stack", "data"),
+)
+def master_cb(reload_n, back_n, click, search_q, trace_txt, compare_txt,
+              mn, method, k, viz, dim_str, cluster_labels_json, nav_json):
+    tid = ctx.triggered_id or "btn-reload"
+    stack = json.loads(nav_json) if nav_json else init_stack(mn)
+
+    # ── Back button ──
+    if tid == "btn-back":
+        stack = nav_pop(stack)
+        # If we popped back to model level, just fall through to overview
+
+    # ── Model change → reset stack ──
+    if tid == "model-sel":
+        stack = init_stack(mn)
+
+    cur = nav_current(stack)
+
+    # ── Load & compute ──
+    try:
+        model, tok, E, voc, sidx, X, coords2, coords3, labels, texts, r, dim_indices, cl = \
+            _compute(mn, method, k, dim_str, cluster_labels_json)
+    except Exception as e:
+        msg = f"Error: {e}"
+        return (empty_fig(msg), empty_fig(), empty_fig(),
+                nav_crumbs(stack), msg, "", json.dumps(stack),
+                [html.Span(msg)])
+
+    V, d = E.shape
+    n = len(sidx)
+    stats = manifold_stats(X[:, dim_indices] if dim_indices else X, labels)
+
+    dim_info = f" | dims: {len(dim_indices)}/{d}" if dim_indices else f" | dims: {d}"
+    status = [
+        html.Span(f"Model: {mn}"),
+        html.Span(f"Tokens: {n}/{V}{dim_info}"),
+        html.Span(f"Clusters: {k} | Method: {method}"),
+        html.Span(level_label(stack)),
+    ]
+
+    # ── Handle click → navigate into cluster or token ──
+    if tid == "main-plot" and click:
+        pt = click["points"][0]
+        curve = pt.get("curveNumber", 0)
+        pidx = pt.get("pointIndex", pt.get("pointNumber", 0))
+
+        if cur.get("level") == "model":
+            # Clicking on overview → go to cluster
+            # Determine which cluster was clicked
+            unique_sorted = sorted(np.unique(labels))
+            if curve < len(unique_sorted):
+                cid = unique_sorted[curve]
+                clabel = cl.get(cid, f"Cluster {cid}")
+                entry = {"level": "cluster", "id": int(cid), "label": f"🔵 {clabel}"}
+                stack = nav_push(stack, entry)
+            # else ignore
+
+        elif cur.get("level") == "cluster":
+            # Clicking inside a cluster → go to token
+            cid = cur["id"]
+            mask = labels == cid
+            cluster_indices = np.where(mask)[0]
+            if pidx < len(cluster_indices):
+                local_idx = cluster_indices[pidx]
+                global_idx = int(sidx[local_idx])
+                tok_text = voc.get(global_idx, "?").strip() or f"id:{global_idx}"
+                entry = {"level": "token", "id": global_idx, "label": f"🔤 {tok_text}"}
+                stack = nav_push(stack, entry)
+
+        # For token level clicks, don't navigate further (prevent infinite loops)
+
+    cur = nav_current(stack)
+
+    # ══════════════════════════════════════════════════════════
+    # VIEW: Model overview
+    # ══════════════════════════════════════════════════════════
+    if cur.get("level") == "model":
+        # Search handling
+        if tid == "search-box" and search_q:
+            results = search(E, voc, search_q, tok)
+            info_lines = [f"**Search: '{search_q}'** — {len(results)} results"]
+            for idx_r, sim, word in results[:20]:
+                info_lines.append(f"`{word.strip()}` (id={idx_r}, sim={sim:.3f})")
+            info = html.Div([html.P(l) for l in info_lines])
+        else:
+            summ = cluster_summary(labels, voc, 6)
+            info_lines = []
+            for cid_s, exs in sorted(summ.items()):
+                clabel = cl.get(cid_s, f"C{cid_s}")
+                info_lines.append(f"**{clabel}**: {', '.join(exs)}")
+            info = html.Div([dcc.Markdown(l) for l in info_lines])
+
+        # Main plot
+        coords = coords3 if viz == "scatter3d" else coords2
+        title = f"Token Embedding Space ({method.upper()}, k={k})"
+        if viz == "scatter3d":
+            main = fig_scatter_3d(coords, labels, texts, title, cluster_labels=cl)
+        elif viz == "heatmap":
+            sim_mat = compare_tokens(X, list(range(min(100, n))))
+            tl = texts[:100]
+            main = fig_heatmap(sim_mat, tl, tl, "Pairwise Similarity (first 100)")
+        elif viz == "parallel":
+            main = fig_parallel(X, labels)
+        else:
+            main = fig_scatter(coords, labels, texts, title, cluster_labels=cl)
+
+        # Detail: variance / PCA info
+        pca_tex = tex_pca(r.get("info", {}))
+        detail = fig_bars(E.std(axis=0), "Dimension Std Dev across Vocabulary")
+
+        # Aux: norm distribution
+        norms = np.linalg.norm(X, axis=1)
+        aux = go.Figure(go.Histogram(x=norms, nbinsx=60, marker_color="#4a9eff"))
+        aux = _lay(aux, "Token Norm Distribution", 300)
+
+        math = dcc.Markdown(f"$${tex_overview(E, n)}$$  \n$${pca_tex}$$", mathjax=True)
+
+        return (main, detail, aux, nav_crumbs(stack), math, info,
+                json.dumps(stack), status)
+
+    # ══════════════════════════════════════════════════════════
+    # VIEW: Cluster detail
+    # ══════════════════════════════════════════════════════════
+    if cur.get("level") == "cluster":
+        cid = cur["id"]
+        mask = labels == cid
+        c_coords2 = coords2[mask]
+        c_coords3 = coords3[mask]
+        c_texts = [texts[i] for i in np.where(mask)[0]]
+        c_labels = np.zeros(int(mask.sum()), dtype=int)
+        c_X = X[mask]
+
+        clabel = cl.get(cid, f"Cluster {cid}")
+        title = f"Cluster: {clabel} ({mask.sum()} tokens)"
+
+        if viz == "scatter3d":
+            main = fig_scatter_3d(c_coords3, c_labels, c_texts, title)
+        else:
+            main = fig_scatter(c_coords2, c_labels, c_texts, title)
+
+        # Detail: centroid dimensions
+        centroid = c_X.mean(axis=0)
+        detail = fig_bars(centroid, f"Centroid of {clabel}", top_k=50)
+
+        # Aux: radar of top dims
+        aux = fig_radar(centroid)
+
+        s = stats.get(cid, {})
+        math = dcc.Markdown(f"$${tex_cluster(stats, cid)}$$", mathjax=True)
+
+        examples = cluster_examples(labels, voc, cid, 20)
+        info = html.Div([
+            html.P(f"**{clabel}** — {s.get('size', '?')} tokens, spread={s.get('spread', 0):.3f}"),
+            html.P(f"Examples: {', '.join(examples)}"),
+        ])
+
+        return (main, detail, aux, nav_crumbs(stack), math, info,
+                json.dumps(stack), status)
+
+    # ══════════════════════════════════════════════════════════
+    # VIEW: Token detail
+    # ══════════════════════════════════════════════════════════
+    if cur.get("level") == "token":
+        gid = cur["id"]
+        vec = E[gid]
+        tok_text = voc.get(gid, "?").strip()
+
+        # Main: bar chart of dimensions
+        main = fig_bars(vec, f"Embedding of '{tok_text}' (id={gid})")
+
+        # Detail: neighbors
+        nb_idx, nb_sims = neighbors(E, gid, 20)
+        nb_texts = [voc.get(int(i), "?").strip() for i in nb_idx]
+        detail = go.Figure(go.Bar(
+            x=nb_texts, y=nb_sims.tolist(),
+            marker_color="#4a9eff"))
+        detail = _lay(detail, f"Nearest Neighbors of '{tok_text}'", 350)
+
+        # Aux: radar
+        aux = fig_radar(vec)
+
+        math = dcc.Markdown(f"$${tex_token(vec)}$$", mathjax=True)
+
+        od = outlier_dims(vec, E, 10)
+        info = html.Div([
+            html.P(f"**{tok_text}** (id={gid})"),
+            html.P(f"Norm: {nrm(vec):.3f}"),
+            html.P(f"Top outlier dims: {', '.join(f'd{i}' for i in od)}"),
+            html.P(f"Neighbors: {', '.join(nb_texts[:10])}"),
+        ])
+
+        return (main, detail, aux, nav_crumbs(stack), math, info,
+                json.dumps(stack), status)
+
+    # ══════════════════════════════════════════════════════════
+    # VIEW: Trace
+    # ══════════════════════════════════════════════════════════
+    if cur.get("level") == "trace" or (tid == "trace-input" and trace_txt):
+        txt = trace_txt or cur.get("id", "Hello world")
+        if tid == "trace-input" and trace_txt:
+            entry = {"level": "trace", "id": txt, "label": f"📈 {txt[:20]}…"}
+            stack = nav_push(stack, entry)
+
+        acts = activations(model, tok, txt)
+        tids = token_ids(tok, txt)
+        tok_strs = [tok.decode([t]) for t in tids]
+
+        if len(tids) > 0:
+            path = token_path(acts, 0)
+            main = fig_path(path, [f"L{i}" for i in range(len(path))])
+
+            dp = delta_path(path)
+            delta_norms = np.linalg.norm(dp, axis=1)
+            detail = go.Figure(go.Bar(
+                x=[f"L{i}→L{i+1}" for i in range(len(delta_norms))],
+                y=delta_norms.tolist(), marker_color="#a855f7"))
+            detail = _lay(detail, "Layer-to-layer change (‖Δ‖)", 300)
+        else:
+            main = empty_fig("No tokens")
+            detail = empty_fig()
+
+        # Attention
+        if len(tids) > 1:
+            am = attn_maps(model, tok, txt)
+            aux = fig_attn(am[0], tok_strs, head=0, title="Layer 0, Head 0 Attention")
+        else:
+            aux = empty_fig("Need 2+ tokens for attention")
+
+        math = dcc.Markdown(f"$${tex_delta()}$$", mathjax=True)
+        info = html.Div([
+            html.P(f"**Tracing:** {txt}"),
+            html.P(f"Tokens: {' | '.join(tok_strs)}"),
+        ])
+
+        return (main, detail, aux, nav_crumbs(stack), math, info,
+                json.dumps(stack), status)
+
+    # ══════════════════════════════════════════════════════════
+    # VIEW: Compare
+    # ══════════════════════════════════════════════════════════
+    if cur.get("level") == "compare" or (tid == "compare-input" and compare_txt):
+        txt = compare_txt or cur.get("id", "king, queen")
+        if tid == "compare-input" and compare_txt:
+            entry = {"level": "compare", "id": txt, "label": f"⚖️ {txt[:20]}…"}
+            stack = nav_push(stack, entry)
+
+        words = [w.strip() for w in txt.split(",") if w.strip()]
+        ids_list = []
+        word_labels = []
+        for w in words:
+            enc = tok.encode(w)
+            if enc:
+                ids_list.append(enc[0])
+                word_labels.append(voc.get(enc[0], w).strip())
+
+        if len(ids_list) >= 2:
+            sim_mat = compare_tokens(E, ids_list)
+            main = fig_heatmap(sim_mat, word_labels, word_labels, "Pairwise Cosine Similarity")
+
+            sd = shared_dims(E, ids_list, 20)
+            vals = E[ids_list].mean(axis=0)
+            detail = fig_bars(vals, "Mean embedding of compared tokens")
+
+            # Individual norms
+            norms_c = [nrm(E[i]) for i in ids_list]
+            aux = go.Figure(go.Bar(x=word_labels, y=norms_c, marker_color="#4a9eff"))
+            aux = _lay(aux, "Token Norms", 300)
+        else:
+            main = empty_fig("Need 2+ comma-separated tokens")
+            detail = empty_fig()
+            aux = empty_fig()
+
+        math = ""
+        info = html.Div([html.P(f"**Comparing:** {', '.join(word_labels)}")])
+
+        return (main, detail, aux, nav_crumbs(stack), math, info,
+                json.dumps(stack), status)
+
+    # ── Fallback ──
+    return (empty_fig(), empty_fig(), empty_fig(),
+            nav_crumbs(stack), "", "", json.dumps(stack), status)
+
+
+# ══════════════════════════════════════════════════════════════
+# SECTION 5: MAIN
 # ══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     con.print(Panel.fit(
-        "[bold green]LLM Vector Space Explorer[/bold green]\n"
-        "[link=http://127.0.0.1:8050]http://127.0.0.1:8050[/link]",
-        border_style="cyan", title="🔬 Ready"
-    ))
-    # Pre-load default model so first page load is fast
-    try:
-        load(con, DEFAULT_MODEL)
-    except Exception:
-        con.print_exception(show_locals=False)
-    app.run(debug=False, host="127.0.0.1", port=8050)
+        "[bold cyan]LLM Vector Space Explorer[/bold cyan]\n"
+        "[dim]Navigate to http://localhost:8050[/dim]",
+        border_style="cyan"))
+    app.run(debug=False, port=8050)
