@@ -430,135 +430,115 @@ def fig_attn(am, tokens, head=0, title=""):
 
 # ── Render engine ─────────────────────────────────────────────
 
-def render(con, stack, viz, red, k, mn, trace_text="",
-           a_layer=0, a_head=0, t_pos=0):
-    cur = nav_current(stack)
-    mdl, tok = load(mn)
-    E = embed_matrix(mdl)
-    voc = vocab(con, tok)
-    figs = {"main": empty_fig(), "detail": empty_fig(), "bars": empty_fig()}
-    tex, info = "", ""
+def render(E, tokens, meta, n_dims=3, max_tokens=5000,
+           red="umap", clust="kmeans", k=8, search=None, trace=None,
+           plot_type="scatter", layer=None, head=None):
+    """
+    Main render pipeline:
+      - subsample up to max_tokens
+      - reduce to n_dims dimensions
+      - cluster
+      - build figures dict
+    """
+    figs = {}
 
-    try:
-        if cur["level"] == "model":
-            # SAMPLE for speed
-            sidx = sample_indices(len(E))
-            Esub = E[sidx]
-            r = reduce(Esub, method=red)
-            labs = cluster(Esub, k=k)
-            # Map labels back to global vocab through sidx
-            smry = {}
-            for c in np.unique(labs):
-                if c < 0: continue
-                global_ids = sidx[labs == c]
-                ex = [voc.get(int(i), "?").strip() or "." for i in global_ids[:10]]
-                smry[int(c)] = ex
-            hover = [", ".join(smry.get(int(labs[i]), ["?"]))[:60] for i in range(len(Esub))]
-            figs["main"] = fig_scatter(r["coords"], labs, hover,
-                                        f"Embedding Space -- {mn} ({len(sidx)} tokens)")
-            tex = tex_overview(E, len(sidx))
-            pca_info = r.get("info", {})
-            if pca_info:
-                tex += " \\quad " + tex_pca(pca_info)
-            st = manifold_stats(Esub, labs)
-            lines = [f"**C{c}** ({st[c]['size']} tok): {', '.join(smry.get(c, []))}"
-                     for c in sorted(smry)]
-            info = "  \n".join(lines[:15])
-            if viz == "parallel":
-                figs["detail"] = fig_parallel(Esub, labs)
+    # ── subsample ──────────────────────────────────────────────
+    n = min(max_tokens, E.shape[0])
+    idxs = sample_indices(E.shape[0], n)
+    Esub = E[idxs]
+    toks = [tokens[i] for i in idxs]
+    met = [meta[i] for i in idxs] if meta is not None else [None] * n
 
-        elif cur["level"] == "cluster":
-            cid = cur["id"]
-            sidx = sample_indices(len(E))
-            Esub = E[sidx]
-            labs = cluster(Esub, k=k)
-            mask = np.where(labs == cid)[0]
-            if len(mask) == 0:
-                figs["main"] = empty_fig("Empty cluster")
-                return figs, tex, info
-            sub = Esub[mask]
-            r = reduce(sub, method=red)
-            global_ids = sidx[mask]
-            hover = [voc.get(int(global_ids[i]), "?") for i in range(len(sub))]
-            figs["main"] = fig_scatter(r["coords"], np.zeros(len(sub), dtype=int), hover,
-                                        f"Cluster {cid} -- {len(mask)} tokens")
-            st = manifold_stats(Esub, labs)
-            tex = tex_cluster(st, cid) if cid in st else ""
-            ex = [voc.get(int(i), "?").strip() or "." for i in global_ids[:20]]
-            info = f"**Cluster {cid}** -- {len(mask)} tokens  \n"
-            info += f"Examples: {', '.join(ex)}"
-            if viz == "parallel" and len(sub) > 2:
-                figs["detail"] = fig_parallel(sub, np.zeros(len(sub), dtype=int))
+    # ── hover text ─────────────────────────────────────────────
+    hover = []
+    for i, t in enumerate(toks):
+        label = t if len(t) < 40 else t[:37] + "…"
+        hover.append(label)
 
-        elif cur["level"] == "token":
-            tid = cur["id"]
-            vec = E[tid]
-            nbr_idx, nbr_sim = neighbors(E, tid, 30)
-            all_ids = np.concatenate([[tid], nbr_idx])
-            sub = E[all_ids]
-            r = reduce(sub, method=red)
-            hover = [voc.get(int(i), "?") for i in all_ids]
-            labs = np.array([1] + [0] * len(nbr_idx))
-            figs["main"] = fig_scatter(r["coords"], labs, hover,
-                                        f"Neighbors of '{voc.get(tid, '?').strip()}'")
-            figs["bars"] = fig_bars(vec) if viz in ("scatter", "bars") else fig_radar(vec)
-            tex = tex_token(vec)
-            od = outlier_dims(vec, E)
-            tex += f" \\quad \\text{{outlier dims: }}{list(od[:5])}"
-            nlist = [f"{voc.get(int(nbr_idx[i]), '?').strip()} ({nbr_sim[i]:.3f})"
-                     for i in range(min(15, len(nbr_idx)))]
-            info = f"**'{voc.get(tid, '?').strip()}'** -- neighbors:  \n" + ", ".join(nlist)
+    # ── reduce ─────────────────────────────────────────────────
+    r = reduce(Esub, n=n_dims, method=red)
+    coords = r["coords"]
 
-        elif cur["level"] == "trace":
-            if not trace_text:
-                figs["main"] = empty_fig("Enter text and click Trace")
-                return figs, tex, info
-            acts = activations(mdl, tok, trace_text)
-            tids = token_ids(tok, trace_text)
-            tidx = min(t_pos, len(tids) - 1)
-            path = token_path(acts, tidx)
-            ll = [f"L{i}" for i in range(len(path))]
-            figs["main"] = fig_path(path, ll)
-            dp = delta_path(path)
-            if len(dp) > 0:
-                figs["bars"] = fig_bars(dp.mean(0), "Mean delta across layers")
-            tex = tex_delta()
-            tstr = [voc.get(t, "?").strip() for t in tids]
-            info = f"Tracing **'{tstr[tidx]}'** (pos {tidx}) through {len(path)} layers  \n"
-            info += f"Tokens: {' | '.join(f'`{t}`' for t in tstr)}"
+    # ── cluster ────────────────────────────────────────────────
+    labs = cluster(Esub, method=clust, k=k)
 
-        elif cur["level"] == "attention":
-            if not trace_text:
-                figs["main"] = empty_fig("Enter text and click Attention")
-                return figs, tex, info
-            am = attn_maps(mdl, tok, trace_text)
-            tids = token_ids(tok, trace_text)
-            tokens = [voc.get(t, "?").strip() for t in tids]
-            ly = min(a_layer, len(am) - 1)
-            hd = min(a_head, am[ly].shape[0] - 1)
-            figs["main"] = fig_attn(am[ly], tokens, hd, f"Layer {ly} Head {hd}")
-            tex = f"\\text{{Layer }}={ly},\\; \\text{{Head }}={hd}"
-            info = f"**Attention** -- Layer {ly}/{len(am)-1}, Head {hd}  \n"
-            info += f"Tokens: {' -> '.join(tokens)}"
+    # ── title ──────────────────────────────────────────────────
+    title = f"{red.upper()} · {clust} (k={k}) · {n} tokens"
 
-        elif cur["level"] == "compare":
-            ids = cur.get("ids", [])
-            if len(ids) >= 2:
-                sm = compare_tokens(E, ids)
-                lb = [voc.get(int(i), "?").strip() for i in ids]
-                figs["main"] = fig_heatmap(sm, lb, lb, "Token Similarity")
-                sd = shared_dims(E, ids)
-                figs["bars"] = fig_bars(E[ids].mean(0),
-                    f"Shared profile -- top dims: {list(sd[:5])}")
-                tex = f"\\text{{Comparing }} {len(ids)} \\text{{ tokens}}"
-                info = f"**Comparing:** {', '.join(lb)}  \n"
-                info += f"Shared dims: {list(sd[:10])}"
+    # ── main scatter (2D or 3D) ────────────────────────────────
+    if n_dims == 3:
+        figs["main"] = fig_scatter_3d(coords, labs, hover, title)
+    else:
+        figs["main"] = fig_scatter(coords, labs, hover, title)
 
-    except Exception as e:
-        print(f"  Render error: {e}")
-        figs["main"] = empty_fig(f"Error: {str(e)[:80]}")
+    # ── search highlight ───────────────────────────────────────
+    if search:
+        mask = np.array([search.lower() in t.lower() for t in toks])
+        if mask.any():
+            highlight = np.where(mask)[0]
+            if n_dims == 3:
+                figs["main"].add_trace(go.Scatter3d(
+                    x=coords[highlight, 0],
+                    y=coords[highlight, 1],
+                    z=coords[highlight, 2],
+                    mode="markers",
+                    marker=dict(size=6, color="red", symbol="diamond"),
+                    text=[hover[i] for i in highlight],
+                    hovertemplate="%{text}<extra>Search hit</extra>",
+                    name=f'"{search}"',
+                    customdata=highlight.tolist()))
+            else:
+                figs["main"].add_trace(go.Scatter(
+                    x=coords[highlight, 0],
+                    y=coords[highlight, 1],
+                    mode="markers",
+                    marker=dict(size=10, color="red", symbol="diamond"),
+                    text=[hover[i] for i in highlight],
+                    hovertemplate="%{text}<extra>Search hit</extra>",
+                    name=f'"{search}"',
+                    customdata=highlight.tolist()))
 
-    return figs, tex, info
+    # ── trace highlight ────────────────────────────────────────
+    if trace:
+        trace_idxs = [i for i, t in enumerate(toks) if trace.lower() in t.lower()]
+        if trace_idxs:
+            trace_idxs = np.array(trace_idxs)
+            if n_dims == 3:
+                figs["main"].add_trace(go.Scatter3d(
+                    x=coords[trace_idxs, 0],
+                    y=coords[trace_idxs, 1],
+                    z=coords[trace_idxs, 2],
+                    mode="markers+lines",
+                    marker=dict(size=5, color="lime"),
+                    line=dict(color="lime", width=2),
+                    text=[hover[i] for i in trace_idxs],
+                    hovertemplate="%{text}<extra>Trace</extra>",
+                    name=f'trace: "{trace}"',
+                    customdata=trace_idxs.tolist()))
+            else:
+                figs["main"].add_trace(go.Scatter(
+                    x=coords[trace_idxs, 0],
+                    y=coords[trace_idxs, 1],
+                    mode="markers+lines",
+                    marker=dict(size=8, color="lime"),
+                    line=dict(color="lime", width=2),
+                    text=[hover[i] for i in trace_idxs],
+                    hovertemplate="%{text}<extra>Trace</extra>",
+                    name=f'trace: "{trace}"',
+                    customdata=trace_idxs.tolist()))
+
+    # ── secondary plots ────────────────────────────────────────
+    if plot_type == "heatmap" and layer is not None and head is not None:
+        figs["secondary"] = fig_attention_heatmap(layer, head, toks)
+    elif plot_type == "bar":
+        figs["secondary"] = fig_cluster_bar(labs, k)
+    elif plot_type == "cosine":
+        figs["secondary"] = fig_cosine_matrix(Esub, toks)
+
+    # ── cluster stats ──────────────────────────────────────────
+    figs["stats"] = cluster_stats(labs, toks)
+
+    return figs
 
 # ── Layout ────────────────────────────────────────────────────
 
@@ -700,6 +680,21 @@ sidebar = html.Div(className="sidebar", children=[
         dcc.Slider(id="attn-head", min=0, max=11, step=1, value=0,
                    marks=None, tooltip={"placement": "bottom"}),
     ]),
+    _sec("Visualization", [
+        html.Label("Max tokens"),
+        dcc.Slider(id="max-tokens-slider", min=1000, max=20000, step=1000, value=5000,
+                   marks={1000: "1k", 5000: "5k", 10000: "10k", 20000: "20k"},
+                   tooltip={"placement": "bottom"}),
+        html.Label("Plot type"),
+        # ... rest stays the same
+        ]),
+    html.Label("Dimensions"),
+    dcc.RadioItems(id="n-dims",
+        options=[{"label": "2D", "value": 2}, {"label": "3D", "value": 3}],
+        value=3,  # default to 3D
+        style={"fontSize": "12px"},
+        labelStyle={"display": "inline-block", "marginRight": "12px"}),
+
     _sec("Compare", [
         html.Label("Comma-separated tokens"),
         dcc.Input(id="compare-box", placeholder="king,queen,man,woman", debounce=True),
@@ -708,6 +703,24 @@ sidebar = html.Div(className="sidebar", children=[
     html.Button("Back", id="back-btn", n_clicks=0, className="btn-secondary",
                 style={"marginTop": "8px"}),
 ])
+
+def fig_scatter_3d(coords, labels, texts, title=""):
+    fig = go.Figure()
+    for c in sorted(np.unique(labels)):
+        mask = labels == c
+        name = f"Cluster {c}" if c >= 0 else "Noise"
+        idxs = np.where(mask)[0]
+        fig.add_trace(go.Scatter3d(
+            x=coords[mask, 0],
+            y=coords[mask, 1],
+            z=coords[mask, 2],
+            mode="markers",
+            marker=dict(size=3, opacity=0.65),
+            text=[texts[i] for i in idxs],
+            hovertemplate="%{text}<extra>" + name + "</extra>",
+            name=name,
+            customdata=idxs.tolist()))
+    return _lay(fig, title, h=650)
 
 main_area = html.Div(className="main", children=[
     html.Div(className="crumb-bar", children=[
@@ -773,6 +786,8 @@ app.layout = html.Div([sidebar, main_area])
     Input("attn-layer", "value"),
     Input("attn-head", "value"),
     Input("trace-pos", "value"),
+    Input("max-tokens-slider", "value"),
+    Input("n-dims", "value"),
     # State
     State("nav-store", "data"),
     State("search-box", "value"),
@@ -782,6 +797,7 @@ app.layout = html.Div([sidebar, main_area])
 )
 def master_cb(click, back_n, search_n, trace_n, attn_n, compare_n,
               model_name, viz, red, k, a_layer, a_head, t_pos,
+              max_tokens_val, n_dims_val,
               nav_json, search_q, trace_txt, compare_txt):
 
     mn = model_name or DEFAULT_MODEL
@@ -797,12 +813,14 @@ def master_cb(click, back_n, search_n, trace_n, attn_n, compare_n,
     mx_head = n_heads(mdl) - 1
     mx_trace = 20
 
-    # ── Nav triggers ──
+    max_tok = max_tokens_val or MAX_TOKENS
+    ndims = n_dims_val or 3
+    red = red or DEFAULT_REDUCE
+    k = k or DEFAULT_K
+    viz = viz or DEFAULT_VIZ
+
+    # ── Nav triggers ──────────────────────────────────────────
     if triggered == "model-sel":
-        # Clear stale caches on model switch
-        keys_to_clear = [k for k in _CACHE if k.startswith("vocab_") or k.startswith("embed_")]
-        for k in keys_to_clear:
-            _CACHE.pop(k, None)
         stack = init_stack(mn)
         con.print(f"[bold cyan]Switching to {mn}...[/bold cyan]")
 
@@ -813,7 +831,7 @@ def master_cb(click, back_n, search_n, trace_n, attn_n, compare_n,
         pt = click["points"][0]
         cur = nav_current(stack)
         if cur["level"] == "model":
-            sidx = sample_indices(len(E))
+            sidx = sample_indices(E.shape[0], min(max_tok, E.shape[0]))
             labs = cluster(E[sidx], k=k)
             ci = pt.get("customdata", pt.get("pointIndex", 0))
             cid = int(labs[int(ci)])
@@ -823,7 +841,7 @@ def master_cb(click, back_n, search_n, trace_n, attn_n, compare_n,
                 "label": f"C{cid}: {', '.join(ex)}"})
         elif cur["level"] == "cluster":
             cid = cur["id"]
-            sidx = sample_indices(len(E))
+            sidx = sample_indices(E.shape[0], min(max_tok, E.shape[0]))
             labs = cluster(E[sidx], k=k)
             mask = np.where(labs == cid)[0]
             li = int(pt.get("customdata", pt.get("pointIndex", 0)))
@@ -870,16 +888,284 @@ def master_cb(click, back_n, search_n, trace_n, attn_n, compare_n,
     if cur.get("level") == "trace" and trace_txt:
         mx_trace = max(len(token_ids(tok, trace_txt)) - 1, 0)
 
-    # ── Render ──
-    figs, tex, info = render(con, stack, viz, red, k, mn, trace_txt or "",
-                              a_layer or 0, a_head or 0, t_pos or 0)
+    # ── Render per level ──────────────────────────────────────
+    level = cur.get("level", "model")
+    main_fig = empty_fig()
+    detail_fig = empty_fig()
+    bars_fig = empty_fig()
+    tex = ""
+    info = ""
 
+    # Build full token list for the vocabulary
+    all_tokens = [voc.get(i, "?").strip() or "." for i in range(E.shape[0])]
+
+    if level == "model":
+        # ── Model overview: scatter of sampled embeddings ─────
+        n = min(max_tok, E.shape[0])
+        sidx = sample_indices(E.shape[0], n)
+        Esub = E[sidx]
+        toks = [all_tokens[i] for i in sidx]
+
+        r = reduce(Esub, n=ndims, method=red)
+        coords = r["coords"]
+        labs = cluster(Esub, method="kmeans", k=k)
+        title = f"{red.upper()} · kmeans (k={k}) · {n} tokens"
+
+        # Hover text
+        hover = [t if len(t) < 40 else t[:37] + "…" for t in toks]
+
+        # Main scatter
+        if ndims == 3:
+            main_fig = fig_scatter_3d(coords, labs, hover, title)
+        else:
+            main_fig = fig_scatter(coords, labs, hover, title)
+
+        # Search highlight
+        if search_q and triggered == "search-btn":
+            smask = np.array([search_q.lower() in t.lower() for t in toks])
+            if smask.any():
+                hi = np.where(smask)[0]
+                if ndims == 3:
+                    main_fig.add_trace(go.Scatter3d(
+                        x=coords[hi, 0], y=coords[hi, 1], z=coords[hi, 2],
+                        mode="markers",
+                        marker=dict(size=6, color="red", symbol="diamond"),
+                        text=[hover[i] for i in hi],
+                        hovertemplate="%{text}<extra>Search hit</extra>",
+                        name=f'"{search_q}"', customdata=hi.tolist()))
+                else:
+                    main_fig.add_trace(go.Scatter(
+                        x=coords[hi, 0], y=coords[hi, 1],
+                        mode="markers",
+                        marker=dict(size=10, color="red", symbol="diamond"),
+                        text=[hover[i] for i in hi],
+                        hovertemplate="%{text}<extra>Search hit</extra>",
+                        name=f'"{search_q}"', customdata=hi.tolist()))
+
+        # Trace highlight
+        if trace_txt:
+            tidxs = [i for i, t in enumerate(toks) if trace_txt.lower() in t.lower()]
+            if tidxs:
+                tidxs = np.array(tidxs)
+                if ndims == 3:
+                    main_fig.add_trace(go.Scatter3d(
+                        x=coords[tidxs, 0], y=coords[tidxs, 1], z=coords[tidxs, 2],
+                        mode="markers+lines",
+                        marker=dict(size=5, color="lime"),
+                        line=dict(color="lime", width=2),
+                        text=[hover[i] for i in tidxs],
+                        hovertemplate="%{text}<extra>Trace</extra>",
+                        name=f'trace: "{trace_txt}"', customdata=tidxs.tolist()))
+                else:
+                    main_fig.add_trace(go.Scatter(
+                        x=coords[tidxs, 0], y=coords[tidxs, 1],
+                        mode="markers+lines",
+                        marker=dict(size=8, color="lime"),
+                        line=dict(color="lime", width=2),
+                        text=[hover[i] for i in tidxs],
+                        hovertemplate="%{text}<extra>Trace</extra>",
+                        name=f'trace: "{trace_txt}"', customdata=tidxs.tolist()))
+
+        # Detail: cluster size bar chart
+        unique, counts = np.unique(labs, return_counts=True)
+        detail_fig = _lay(go.Figure(go.Bar(
+            x=[f"C{c}" for c in unique], y=counts,
+            marker_color=px.colors.qualitative.Plotly[:len(unique)]
+        )), f"Cluster sizes (k={k})", 300)
+
+        # Bars: PCA variance or top dims
+        if "variance" in r.get("info", {}):
+            var = r["info"]["variance"]
+            bars_fig = _lay(go.Figure(go.Bar(
+                x=[f"PC{i+1}" for i in range(len(var))], y=var,
+                marker_color="#4a9eff"
+            )), "PCA Explained Variance", 300)
+        else:
+            # Show norm distribution
+            norms = np.linalg.norm(Esub, axis=1)
+            bars_fig = _lay(go.Figure(go.Histogram(
+                x=norms, nbinsx=50, marker_color="#4a9eff"
+            )), "Embedding Norm Distribution", 300)
+
+        tex = tex_overview(E, n_sampled=n)
+        ms = manifold_stats(Esub, labs)
+        summ = cluster_summary(labs, {i: toks[i] for i in range(len(toks))}, n=6)
+        info_lines = []
+        for cid_s in sorted(ms.keys()):
+            ex = summ.get(cid_s, [])
+            info_lines.append(f"**C{cid_s}** (n={ms[cid_s]['size']}, "
+                              f"spread={ms[cid_s]['spread']:.3f}): "
+                              f"{', '.join(ex[:6])}")
+        info = "\n\n".join(info_lines)
+
+    elif level == "cluster":
+        # ── Cluster drill-down ────────────────────────────────
+        cid = cur["id"]
+        sidx = sample_indices(E.shape[0], min(max_tok, E.shape[0]))
+        labs = cluster(E[sidx], k=k)
+        mask = labs == cid
+        gids = sidx[mask]
+
+        if len(gids) < 2:
+            main_fig = empty_fig(f"Cluster {cid} has < 2 tokens")
+        else:
+            Csub = E[gids]
+            ctoks = [all_tokens[i] for i in gids]
+            hover = [t if len(t) < 40 else t[:37] + "…" for t in ctoks]
+            r = reduce(Csub, n=ndims, method=red)
+            coords = r["coords"]
+            sub_labs = cluster(Csub, method="kmeans", k=min(k, len(gids) - 1))
+            title = f"Cluster {cid} · {len(gids)} tokens"
+
+            if ndims == 3:
+                main_fig = fig_scatter_3d(coords, sub_labs, hover, title)
+            else:
+                main_fig = fig_scatter(coords, sub_labs, hover, title)
+
+        # Detail: norms within cluster
+        if len(gids) >= 2:
+            norms = np.linalg.norm(E[gids], axis=1)
+            detail_fig = _lay(go.Figure(go.Histogram(
+                x=norms, nbinsx=30, marker_color="#4a9eff"
+            )), f"Norm distribution C{cid}", 300)
+
+        tex = tex_cluster(manifold_stats(E[sidx], labs), cid)
+        info = f"Cluster {cid}: {len(gids)} tokens"
+
+    elif level == "token":
+        # ── Token neighborhood ────────────────────────────────
+        tid = cur["id"]
+        vec = E[tid]
+        nbr_idx, nbr_sims = neighbors(E, tid, 30)
+        ai = np.concatenate([[tid], nbr_idx])
+        Nsub = E[ai]
+        ntoks = [all_tokens[i] for i in ai]
+        hover = [f"{'→ ' if i == 0 else ''}{t}" for i, t in enumerate(ntoks)]
+
+        r = reduce(Nsub, n=min(ndims, Nsub.shape[0] - 1), method=red)
+        coords = r["coords"]
+        labs_n = np.zeros(len(ai), dtype=int)
+        labs_n[0] = 1  # highlight the target token
+
+        actual_dims = coords.shape[1]
+        if actual_dims == 3:
+            main_fig = fig_scatter_3d(coords, labs_n, hover,
+                                      f"Neighbors of '{all_tokens[tid].strip()}'")
+        else:
+            main_fig = fig_scatter(coords, labs_n, hover,
+                                   f"Neighbors of '{all_tokens[tid].strip()}'")
+
+        # Detail: similarity bar
+        detail_fig = _lay(go.Figure(go.Bar(
+            x=[all_tokens[i].strip() for i in nbr_idx[:15]],
+            y=nbr_sims[:15], marker_color="#4a9eff"
+        )), "Cosine Similarity to Neighbors", 300)
+
+        # Bars: raw dimensions
+        bars_fig = fig_bars(vec, f"Dimensions of '{all_tokens[tid].strip()}'")
+
+        tex = tex_token(vec)
+        info = (f"Token #{tid}: **{all_tokens[tid].strip()}**\n\n"
+                f"Top neighbors: " +
+                ", ".join(f"{all_tokens[int(i)].strip()} ({s:.3f})"
+                          for i, s in zip(nbr_idx[:10], nbr_sims[:10])))
+
+    elif level == "trace":
+        # ── Token trace through layers ────────────────────────
+        text = cur["id"]
+        acts = activations(mdl, tok, text)
+        tids = token_ids(tok, text)
+        tp = min(t_pos or 0, len(tids) - 1)
+        mx_trace = max(len(tids) - 1, 0)
+
+        path = token_path(acts, tp)
+        layer_labels = [f"L{i}" for i in range(len(path))]
+        main_fig = fig_path(path, layer_labels)
+
+        # Detail: delta norms
+        dp = delta_path(path)
+        dnorms = np.linalg.norm(dp, axis=1)
+        detail_fig = _lay(go.Figure(go.Bar(
+            x=[f"L{i}→L{i+1}" for i in range(len(dnorms))],
+            y=dnorms, marker_color="#ff6b6b"
+        )), "Layer-to-layer delta norms", 300)
+
+        # Bars: final layer dims
+        bars_fig = fig_bars(path[-1], f"Final layer embedding (pos {tp})")
+
+        tok_str = tok.decode([tids[tp]]) if tp < len(tids) else "?"
+        tex = tex_delta()
+        info = (f"Tracing **'{text}'** — token position {tp}: **{tok_str}**\n\n"
+                f"Path through {len(acts)} layers, "
+                f"max Δ = {dnorms.max():.3f} at L{dnorms.argmax()}→L{dnorms.argmax()+1}")
+
+    elif level == "attention":
+        # ── Attention heatmap ─────────────────────────────────
+        text = cur["id"]
+        am = attn_maps(mdl, tok, text)
+        tids = token_ids(tok, text)
+        tok_strs = [tok.decode([t]) for t in tids]
+        layer = min(a_layer or 0, mx_layer)
+        head_i = min(a_head or 0, mx_head)
+
+        if layer in am:
+            main_fig = fig_attn(am[layer], tok_strs, head=head_i,
+                                title=f"Attention L{layer} H{head_i}")
+        else:
+            main_fig = empty_fig(f"Layer {layer} not available")
+
+        # Detail: attention entropy per head
+        if layer in am:
+            a = am[layer]  # shape: (heads, seq, seq)
+            entropies = []
+            for h in range(a.shape[0]):
+                p = a[h].flatten() + 1e-12
+                entropies.append(float(-np.sum(p * np.log(p))))
+            detail_fig = _lay(go.Figure(go.Bar(
+                x=[f"H{i}" for i in range(len(entropies))],
+                y=entropies,
+                marker_color=["#4a9eff" if i != head_i else "#ff6b6b"
+                               for i in range(len(entropies))]
+            )), f"Attention entropy L{layer}", 300)
+
+        tex = f"\\text{{Attention}}(Q,K,V) = \\text{{softmax}}\\left(\\frac{{QK^T}}{{\\sqrt{{d_k}}}}\\right)V"
+        info = f"Attention for **'{text}'** — Layer {layer}, Head {head_i}, {len(tok_strs)} tokens"
+
+    elif level == "compare":
+        # ── Token comparison ──────────────────────────────────
+        ids = cur.get("ids", [])
+        if len(ids) >= 2:
+            cm = compare_tokens(E, ids)
+            lb = [all_tokens[i].strip() for i in ids]
+            main_fig = fig_heatmap(cm, lb, lb, "Cosine Similarity Matrix")
+
+            # Detail: shared dimensions
+            sd = shared_dims(E, ids, 20)
+            vals = np.abs(E[ids].mean(0))[sd]
+            detail_fig = _lay(go.Figure(go.Bar(
+                x=[f"d{d}" for d in sd], y=vals, marker_color="#4a9eff"
+            )), "Shared high-activation dims", 300)
+
+            # Bars: outlier dims for first token
+            od = outlier_dims(E[ids[0]], E, 20)
+            bars_fig = _lay(go.Figure(go.Bar(
+                x=[f"d{d}" for d in od],
+                y=np.abs(E[ids[0]] - E.mean(0))[od] / (E.std(0)[od] + 1e-9),
+                marker_color="#ff6b6b"
+            )), f"Outlier dims: {lb[0]}", 300)
+
+            tex = f"\\cos(\\mathbf{{v}}_i, \\mathbf{{v}}_j) = \\frac{{\\mathbf{{v}}_i \\cdot \\mathbf{{v}}_j}}{{\\|\\mathbf{{v}}_i\\| \\|\\mathbf{{v}}_j\\|}}"
+            info = f"Comparing: {', '.join(lb)}"
+        else:
+            main_fig = empty_fig("Need at least 2 tokens to compare")
+
+    # ── Assemble output ───────────────────────────────────────
     math_str = f"$${tex}$$" if tex else ""
-    status = f"{mn} | {E.shape[0]} tok x {E.shape[1]}d | {cur.get('level', '?')}"
+    status = f"{mn} | {E.shape[0]} tok × {E.shape[1]}d | {level}"
     info_style = {"display": "block"} if info else {"display": "none"}
 
     return (json.dumps(stack),
-            figs["main"], figs.get("detail", empty_fig()), figs.get("bars", empty_fig()),
+            main_fig, detail_fig, bars_fig,
             nav_crumbs(stack), level_label(stack), math_str,
             dcc.Markdown(info) if info else "", info_style,
             search_res, status,
