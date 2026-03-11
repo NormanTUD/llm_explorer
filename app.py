@@ -19,12 +19,12 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["OPENBLAS_VERBOSE"] = "0"
 
 MODELS = {
-    "gpt2": "GPT-2 (117M)",
-    "gpt2-medium": "GPT-2 Medium (345M)",
-    "distilgpt2": "DistilGPT-2 (82M)",
-    "EleutherAI/pythia-70m": "Pythia 70M",
-    "EleutherAI/pythia-160m": "Pythia 160M",
-}
+        "gpt2": "GPT-2 (117M)",
+        "gpt2-medium": "GPT-2 Medium (345M)",
+        "distilgpt2": "DistilGPT-2 (82M)",
+        "EleutherAI/pythia-70m": "Pythia 70M",
+        "EleutherAI/pythia-160m": "Pythia 160M",
+        }
 
 # ══════════════════════════════════════════════════════════════
 # SECTION 1: VENV BOOTSTRAP
@@ -42,10 +42,10 @@ PY = BIN / ("python.exe" if IS_WIN else "python")
 PIP = BIN / ("pip.exe" if IS_WIN else "pip")
 
 DEPS = [
-    "dash", "plotly", "numpy", "scikit-learn",
-    "torch --index-url https://download.pytorch.org/whl/cpu",
-    "transformers", "umap-learn", "rich",
-]
+        "dash", "plotly", "numpy", "scikit-learn",
+        "torch --index-url https://download.pytorch.org/whl/cpu",
+        "transformers", "umap-learn", "rich",
+        ]
 
 def in_venv():
     return sys.prefix == str(VENV)
@@ -79,9 +79,9 @@ def ensure_venv():
         install_deps()
     else:
         rc = subprocess.call(
-            [str(PY), "-c", "import dash, torch, transformers, sklearn, rich"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+                [str(PY), "-c", "import dash, torch, transformers, sklearn, rich"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
         if rc != 0:
             install_deps()
 
@@ -628,6 +628,14 @@ button:hover { background: #3a8eef; }
     background: #0a0a18; border-top: 1px solid #1f1f3a;
     padding: 4px 16px; font-size: 11px; color: #555;
     display: flex; justify-content: space-between; z-index: 100;
+}
+.dash-input-element {
+    color: black;
+}
+.sidebar {
+    width: 260px; padding: 16px; background: #12122a;
+    min-height: 100vh; position: fixed; overflow-y: auto;
+    border-right: 1px solid #1f1f3a;
 }
 </style></head><body>{%app_entry%}{%config%}{%scripts%}{%renderer%}</body></html>'''
 
