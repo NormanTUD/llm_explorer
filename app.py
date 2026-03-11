@@ -323,35 +323,193 @@ def llm_label_cluster(model, tok, examples, max_examples=100):
 
     return label
 
+def structural_label(examples):
+    """Deterministic morphological/structural tag from token examples."""
+    if not examples:
+        return "empty"
+    n = max(len(examples), 1)
+    n_upper = sum(1 for e in examples if e and e[0].isupper())
+    n_digit = sum(1 for e in examples if any(c.isdigit() for c in e))
+    n_subword = sum(1 for e in examples if e and not e[0].isspace() and e[0].islower()
+                    and not e[0].isdigit())
+    n_punct = sum(1 for e in examples if all(not c.isalnum() for c in e.strip()))
+    n_space = sum(1 for e in examples if e.startswith(" ") or e.startswith("Ġ"))
 
-def llm_label_all_clusters(model, tok, labels, voc, sidx, max_examples=100):
+    tags = []
+    if n_upper / n > 0.5:   tags.append("capitalized")
+    if n_digit / n > 0.4:   tags.append("numeric")
+    if n_punct / n > 0.5:   tags.append("punctuation")
+    if n_space / n > 0.6:   tags.append("word-initial")
+    if n_subword / n > 0.5 and not tags:
+        tags.append("subwords")
+    return " + ".join(tags) if tags else "mixed"
+
+# ── Semantic labeling via local LLM ──────────────────────────
+
+_LABEL_LLM_CACHE = {}
+
+def semantic_label_via_ollama(examples, model_name="mistral", max_examples=80):
     """
-    Generate LLM-based labels for all clusters.
-    Returns dict: cluster_id -> label string
+    Call a local Ollama instance (http://localhost:11434) to label a cluster.
+    Install: https://ollama.com  then `ollama pull mistral`
+    Any model works: mistral, llama3, phi3, gemma2, etc.
+    """
+    import urllib.request, json as _json
+
+    sample = examples[:max_examples]
+    token_list = ", ".join(sample)
+
+    prompt = (
+        "Below are tokens/word-fragments from a language model vocabulary that were "
+        "grouped together because they have similar embeddings.\n\n"
+        f"Tokens: {token_list}\n\n"
+        "What single semantic TOPIC or CONCEPT do these tokens share? "
+        "Respond with ONLY a short label (1-4 words), like: animals, legal terms, "
+        "emotions, body parts, cooking verbs, European geography, time expressions.\n"
+        "If no clear semantic theme exists, respond with: mixed\n\n"
+        "Label:"
+    )
+
+    payload = _json.dumps({
+        "model": model_name,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.0, "num_predict": 20}
+    }).encode()
+
+    req = urllib.request.Request(
+        "http://localhost:11434/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result = _json.loads(resp.read().decode())
+
+    label = result.get("response", "").strip()
+    # Clean: first line, strip quotes/punctuation
+    label = label.split("\n")[0].split(".")[0].strip().strip('"').strip(":-–— ")
+    return label if len(label) >= 2 else None
+
+
+def semantic_label_via_transformers(examples, max_examples=80):
+    """
+    Load a small instruction-tuned model locally via transformers.
+    Uses TinyLlama-Chat (1.1B) — fits in ~3GB RAM. Swap for any
+    chat model you prefer.
+    """
+    import torch
+
+    model_id = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+
+    if "label_model" not in _LABEL_LLM_CACHE:
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        con.print(f"[cyan]Loading label LLM: {model_id}…[/cyan]")
+        t = AutoTokenizer.from_pretrained(model_id)
+        m = AutoModelForCausalLM.from_pretrained(
+            model_id, torch_dtype=torch.float16,
+            device_map="auto" if torch.cuda.is_available() else None,
+        )
+        m.eval()
+        _LABEL_LLM_CACHE["label_model"] = m
+        _LABEL_LLM_CACHE["label_tok"] = t
+        con.print(f"[green]✓ Label LLM loaded[/green]")
+
+    m = _LABEL_LLM_CACHE["label_model"]
+    t = _LABEL_LLM_CACHE["label_tok"]
+
+    sample = examples[:max_examples]
+    token_list = ", ".join(sample)
+
+    # TinyLlama uses ChatML format
+    messages = [
+        {"role": "system", "content": "You label groups of words with a short semantic topic (1-4 words). Respond with ONLY the label."},
+        {"role": "user", "content": (
+            f"These tokens were grouped by embedding similarity: {token_list}\n\n"
+            "What semantic topic do they share? Respond with ONLY a 1-4 word label like: "
+            "animals, legal terms, emotions, European names, time words, science terms.\n"
+            "If no clear theme, say: mixed"
+        )},
+    ]
+
+    # Apply chat template
+    if hasattr(t, "apply_chat_template"):
+        prompt = t.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    else:
+        prompt = f"### User:\n{messages[1]['content']}\n### Assistant:\n"
+
+    inputs = t(prompt, return_tensors="pt")
+    if torch.cuda.is_available():
+        inputs = {k: v.cuda() for k, v in inputs.items()}
+
+    with torch.no_grad():
+        out = m.generate(
+            **inputs,
+            max_new_tokens=20,
+            do_sample=False,
+            temperature=1.0,
+            pad_token_id=t.eos_token_id,
+        )
+
+    generated = out[0][inputs["input_ids"].shape[1]:]
+    label = t.decode(generated, skip_special_tokens=True).strip()
+    label = label.split("\n")[0].split(".")[0].strip().strip('"').strip(":-–— ")
+    return label if len(label) >= 2 else None
+
+def llm_label_all_clusters(model, tok, labels, voc, sidx,
+                           max_examples=100, label_provider="ollama",
+                           ollama_model="mistral"):
+    """
+    Generate two-tier labels: semantic [structural] for all clusters.
+    label_provider: "ollama", "transformers", or "local" (GPT-2 only, original behavior)
     """
     cluster_labels = {}
     unique_clusters = sorted([c for c in np.unique(labels) if c >= 0])
 
+    con.print(f"[cyan]Labeling {len(unique_clusters)} clusters via '{label_provider}'…[/cyan]")
+
     for cid in unique_clusters:
         mask = labels == cid
-        # Map local indices back to global vocab indices
         gids = sidx[mask] if sidx is not None else np.where(mask)[0]
         examples = [voc.get(int(i), "").strip() for i in gids]
         examples = [e for e in examples if e and e != "?" and e != "." and len(e) > 0]
-
         n_total = len(examples)
 
+        # Tier 1: structural (always, free, deterministic)
+        struct = structural_label(examples)
+
+        # Tier 2: semantic (via chosen provider)
+        semantic = None
         try:
-            label = llm_label_cluster(model, tok, examples, max_examples)
-            cluster_labels[cid] = f"{label} ({n_total})"
-            con.print(f"  [green]C{cid}[/green]: {label} ({n_total} tokens)")
+            if label_provider == "ollama":
+                semantic = semantic_label_via_ollama(
+                    examples, model_name=ollama_model, max_examples=max_examples)
+            elif label_provider == "transformers":
+                semantic = semantic_label_via_transformers(
+                    examples, max_examples=max_examples)
+            elif label_provider == "local":
+                # Original GPT-2 based labeling
+                semantic = llm_label_cluster(model, tok, examples, max_examples)
+
+            # Filter out non-semantic results
+            if semantic and semantic.lower() in ("mixed", "unclear", "unknown", "various",
+                                                   "mixed/structural"):
+                semantic = None
+
         except Exception as e:
-            # Fallback: just show a few examples
-            fallback = " / ".join(examples[:4]) if examples else "?"
-            if len(fallback) > 50:
-                fallback = fallback[:47] + "…"
-            cluster_labels[cid] = f"{fallback} ({n_total})"
-            con.print(f"  [yellow]C{cid}[/yellow]: fallback — {e}")
+            con.print(f"  [yellow]C{cid} semantic label failed: {e}[/yellow]")
+
+        # Compose final two-tier label
+        if semantic:
+            label = f"{semantic} [{struct}]"
+        else:
+            # Fallback: show top examples + structural tag
+            preview = ", ".join(examples[:5])
+            if len(preview) > 35:
+                preview = preview[:32] + "…"
+            label = f"{preview} [{struct}]"
+
+        cluster_labels[cid] = f"{label} ({n_total})"
+        con.print(f"  [green]C{cid}[/green]: {label} ({n_total} tokens)")
 
     return cluster_labels
 
@@ -842,12 +1000,32 @@ app.layout = html.Div([
 
         html.Div([
             html.Label("LLM Cluster Labels"),
-            html.P("Max examples per cluster:", style={"fontSize": "10px", "color": "#666", "margin": "2px 0"}),
+
+            html.Label("Label Provider"),
+            dcc.Dropdown(id="label-provider-sel",
+                         options=[
+                             {"label": "🦙 Ollama (local server)", "value": "ollama"},
+                             {"label": "🤗 Transformers (TinyLlama)", "value": "transformers"},
+                             {"label": "📝 GPT-2 only (original)", "value": "local"},
+                             ],
+                         value="ollama", clearable=False,
+                         style={"background": "#1e1e30"}),
+
+            html.Label("Ollama Model"),
+            dcc.Input(id="ollama-model-input", type="text", value="mistral",
+                      placeholder="mistral, llama3, phi3…",
+                      style={"marginBottom": "4px"}),
+            html.P("(only used with Ollama provider)", 
+                   style={"fontSize": "10px", "color": "#555", "margin": "0 0 6px"}),
+
+            html.Label("Max examples per cluster"),
             dcc.Input(id="llm-label-max", type="number", value=LLM_LABEL_MAX_EXAMPLES,
                       min=10, max=2000, step=10, style={"marginBottom": "4px"}),
-            html.Button("Generate LLM Labels", id="btn-llm-labels", className="btn-secondary"),
-            html.Div(id="llm-label-status", style={"fontSize": "11px", "color": "#8888aa", "marginTop": "4px"}),
-        ], className="sb-section"),
+
+            html.Button("Generate Labels", id="btn-llm-labels", className="btn-secondary"),
+            html.Div(id="llm-label-status",
+                     style={"fontSize": "11px", "color": "#8888aa", "marginTop": "4px"}),
+            ], className="sb-section"),
 
         html.Div([
             html.Label("Search"),
@@ -970,33 +1148,40 @@ def update_dim_info(dim_str, mn):
     State("k-slider", "value"),
     State("dim-range-input", "value"),
     State("llm-label-max", "value"),
+    State("label-provider-sel", "value"),
+    State("ollama-model-input", "value"),
     State("cluster-labels-store", "data"),
     prevent_initial_call=True,
 )
-def generate_llm_labels(n_clicks, mn, method, k, dim_str, max_ex, existing_labels):
+def generate_llm_labels(n_clicks, mn, method, k, dim_str, max_ex,
+                         label_provider, ollama_model, existing_labels):
     if not n_clicks or not mn:
         return no_update, no_update
 
     max_ex = max_ex or LLM_LABEL_MAX_EXAMPLES
+    label_provider = label_provider or "ollama"
+    ollama_model = ollama_model or "mistral"
 
     try:
         model, tok, E, voc, sidx, X, *_ = _compute(mn, method, k, dim_str, existing_labels)
 
-        # Re-cluster to get labels
         dim_indices = parse_dim_range(dim_str, E.shape[1])
         X_for_cluster = X[:, dim_indices] if dim_indices else X
         labels = cluster(X_for_cluster, k=k)
 
-        con.print(f"[cyan]Generating LLM labels for {len(np.unique(labels))} clusters…[/cyan]")
-        cl = heuristic_label_all_clusters(labels, voc, sidx, max_examples=max_ex)
+        cl = llm_label_all_clusters(
+            model, tok, labels, voc, sidx,
+            max_examples=max_ex,
+            label_provider=label_provider,
+            ollama_model=ollama_model,
+        )
         con.print(f"[green]✓ Generated {len(cl)} cluster labels[/green]")
-
         return json.dumps({str(k2): v2 for k2, v2 in cl.items()}), f"✓ {len(cl)} labels generated"
 
     except Exception as e:
         con.print(f"[red]LLM labeling error: {e}[/red]")
-        return no_update, f"Error: {str(e)[:80]}"
-
+        import traceback; traceback.print_exc()
+        return no_update, f"Error: {str(e)[:100]}"
 
 # ── Master callback ──────────────────────────────────────────
 
