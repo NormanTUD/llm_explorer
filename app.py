@@ -237,57 +237,94 @@ def manifold_stats(X, labels):
 
 # ── LLM-based cluster labeling ───────────────────────────────
 
-def llm_label_cluster(model, tok, examples, max_examples=500):
+def llm_label_cluster(model, tok, examples, max_examples=100):
     """
-    Use the loaded LLM to generate a short label for a cluster
-    by giving it comma-separated examples and asking it to name the group.
+    Use the loaded LLM to generate a short label for a cluster.
+    We carefully limit examples to fit within the model's context window,
+    and use a tightly constrained prompt + generation to get a usable label.
     """
     import torch
-    # Subsample if too many
-    if len(examples) > max_examples:
-        rng = np.random.default_rng(42)
-        examples = list(rng.choice(examples, max_examples, replace=False))
+
+    # Determine model's max context length
+    max_ctx = getattr(model.config, 'n_positions', None) \
+           or getattr(model.config, 'max_position_embeddings', 1024)
 
     # Clean up examples
-    examples = [e.strip() for e in examples if e.strip() and e.strip() != "."]
+    examples = [e.strip() for e in examples if e.strip() and e.strip() != "." and e.strip() != "?"]
     if not examples:
         return "(empty cluster)"
 
-    example_str = ", ".join(examples[:max_examples])
-    prompt = (
-        f"These words belong to the same group: {example_str}\n"
-        f"A short label for this group is:"
-    )
+    # Deduplicate while preserving order
+    seen = set()
+    unique_examples = []
+    for e in examples:
+        if e.lower() not in seen:
+            seen.add(e.lower())
+            unique_examples.append(e)
+    examples = unique_examples
 
-    input_ids = tok.encode(prompt, return_tensors="pt") if hasattr(tok, '__call__') else torch.tensor([tok.encode(prompt)])
-    if hasattr(tok, '__call__'):
-        input_ids = tok(prompt, return_tensors="pt")["input_ids"]
-    else:
-        input_ids = torch.tensor([tok.encode(prompt)])
+    # Subsample if too many
+    if len(examples) > max_examples:
+        rng = np.random.default_rng(42)
+        indices = rng.choice(len(examples), max_examples, replace=False)
+        examples = [examples[i] for i in sorted(indices)]
+
+    # Build prompt, but we must ensure it fits in context.
+    # Reserve tokens for generation (10) and some safety margin (50).
+    max_prompt_tokens = max_ctx - 60
+
+    # Start with a tight prompt format that steers GPT-2 better
+    prefix = 'Word category: "'
+    suffix_after_examples = '"\nCategory name:'
+
+    # Incrementally add examples until we'd exceed the token budget
+    selected = []
+    for ex in examples:
+        candidate = prefix + ", ".join(selected + [ex]) + suffix_after_examples
+        n_tokens = len(tok.encode(candidate))
+        if n_tokens > max_prompt_tokens:
+            break
+        selected.append(ex)
+
+    if not selected:
+        # Even one example is too long? Just use first 3 chars
+        selected = [examples[0][:20]]
+
+    prompt = prefix + ", ".join(selected) + suffix_after_examples
+
+    input_ids = tok(prompt, return_tensors="pt")["input_ids"]
 
     with torch.no_grad():
         out = model.generate(
             input_ids,
-            max_new_tokens=20,
+            max_new_tokens=12,
             do_sample=False,
             temperature=1.0,
             pad_token_id=tok.eos_token_id,
+            repetition_penalty=1.3,
         )
 
     generated = out[0][input_ids.shape[1]:]
     label = tok.decode(generated, skip_special_tokens=True).strip()
 
-    # Clean: take first line, first sentence, limit length
-    label = label.split("\n")[0].split(".")[0].strip()
-    if len(label) > 60:
-        label = label[:57] + "…"
-    if not label:
-        label = f"({', '.join(examples[:3])}…)"
+    # Clean up: take first line, first sentence, strip quotes/punctuation
+    label = label.split("\n")[0].split(".")[0].split('"')[0].strip()
+    label = label.strip(":-–— \t")
+
+    if len(label) > 50:
+        label = label[:47] + "…"
+
+    # If the model produced garbage or empty, fall back to showing top examples
+    if not label or len(label) < 2 or label.lower().startswith("the ") and len(label) > 40:
+        # Fallback: pick 3 representative examples as the label
+        label = " / ".join(selected[:4])
+        if len(label) > 50:
+            label = label[:47] + "…"
 
     return label
 
 
-def llm_label_all_clusters(model, tok, labels, voc, sidx, max_examples=500):
+def llm_label_all_clusters(model, tok, labels, voc, sidx, max_examples=100):
     """
     Generate LLM-based labels for all clusters.
     Returns dict: cluster_id -> label string
@@ -297,19 +334,26 @@ def llm_label_all_clusters(model, tok, labels, voc, sidx, max_examples=500):
 
     for cid in unique_clusters:
         mask = labels == cid
+        # Map local indices back to global vocab indices
         gids = sidx[mask] if sidx is not None else np.where(mask)[0]
-        examples = [voc.get(int(i), "?").strip() for i in gids]
-        examples = [e for e in examples if e and e != "?" and e != "."]
+        examples = [voc.get(int(i), "").strip() for i in gids]
+        examples = [e for e in examples if e and e != "?" and e != "." and len(e) > 0]
+
+        n_total = len(examples)
 
         try:
             label = llm_label_cluster(model, tok, examples, max_examples)
-            cluster_labels[cid] = label
+            cluster_labels[cid] = f"{label} ({n_total})"
+            con.print(f"  [green]C{cid}[/green]: {label} ({n_total} tokens)")
         except Exception as e:
-            cluster_labels[cid] = f"C{cid} ({len(examples)} tokens)"
-            con.print(f"[yellow]Warning: LLM labeling failed for cluster {cid}: {e}[/yellow]")
+            # Fallback: just show a few examples
+            fallback = " / ".join(examples[:4]) if examples else "?"
+            if len(fallback) > 50:
+                fallback = fallback[:47] + "…"
+            cluster_labels[cid] = f"{fallback} ({n_total})"
+            con.print(f"  [yellow]C{cid}[/yellow]: fallback — {e}")
 
     return cluster_labels
-
 
 # ── Layer 4: Comparison ──────────────────────────────────────
 
