@@ -355,6 +355,111 @@ def llm_label_all_clusters(model, tok, labels, voc, sidx, max_examples=100):
 
     return cluster_labels
 
+def heuristic_label_cluster(examples, max_label_len=50):
+    """
+    Generate a descriptive label for a cluster using heuristic analysis
+    instead of relying on GPT-2 generation.
+    """
+    examples = [e.strip() for e in examples if e.strip() and e not in (".", "?", "")]
+    if not examples:
+        return "(empty cluster)"
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for e in examples:
+        low = e.lower().strip()
+        if low not in seen:
+            seen.add(low)
+            unique.append(e)
+    examples = unique
+
+    # --- Strategy 1: Check for common prefix/suffix patterns ---
+    cleaned = [e.strip().lower() for e in examples if len(e.strip()) > 1]
+
+    if cleaned:
+        # Check common prefix (at least 2 chars)
+        prefix = os.path.commonprefix(cleaned)
+        if len(prefix) >= 3:
+            return f"prefix: '{prefix}…'"
+
+        # Check common suffix
+        reversed_strs = [s[::-1] for s in cleaned]
+        suffix = os.path.commonprefix(reversed_strs)[::-1]
+        if len(suffix) >= 3:
+            return f"suffix: '…{suffix}'"
+
+    # --- Strategy 2: Character-type analysis ---
+    has_alpha = sum(1 for e in examples if any(c.isalpha() for c in e))
+    has_digit = sum(1 for e in examples if any(c.isdigit() for c in e))
+    has_upper = sum(1 for e in examples if e.strip() and e.strip()[0].isupper())
+    has_punct = sum(1 for e in examples if all(not c.isalnum() for c in e.strip()))
+    avg_len = np.mean([len(e.strip()) for e in examples]) if examples else 0
+    n = len(examples)
+
+    type_tags = []
+    if has_punct / max(n, 1) > 0.5:
+        type_tags.append("punctuation/symbols")
+    if has_digit / max(n, 1) > 0.5:
+        type_tags.append("numeric")
+    if has_upper / max(n, 1) > 0.7:
+        type_tags.append("capitalized")
+    if avg_len < 2.5:
+        type_tags.append("short fragments")
+    elif avg_len > 8:
+        type_tags.append("long tokens")
+
+    # --- Strategy 3: Check if tokens are mostly real words ---
+    # Tokens starting with space are typically full words in GPT-2
+    space_prefixed = sum(1 for e in examples if e.startswith(" ") or e.startswith("Ġ"))
+    if space_prefixed / max(n, 1) > 0.6:
+        type_tags.append("whole words")
+    elif space_prefixed / max(n, 1) < 0.2:
+        type_tags.append("subwords/continuations")
+
+    # --- Strategy 4: Pick most representative examples ---
+    # Sort by frequency-like heuristic: prefer readable tokens
+    readable = [e for e in examples if len(e.strip()) >= 2 and any(c.isalpha() for c in e)]
+    representatives = (readable or examples)[:5]
+    rep_str = ", ".join(r.strip() for r in representatives)
+    if len(rep_str) > 35:
+        rep_str = rep_str[:32] + "…"
+
+    if type_tags:
+        label = f"{' + '.join(type_tags[:2])}: {rep_str}"
+    else:
+        label = rep_str
+
+    if len(label) > max_label_len:
+        label = label[:max_label_len - 1] + "…"
+
+    return label
+
+
+def heuristic_label_all_clusters(labels, voc, sidx, max_examples=500):
+    """Generate heuristic labels for all clusters."""
+    cluster_labels = {}
+    unique_clusters = sorted([c for c in np.unique(labels) if c >= 0])
+
+    for cid in unique_clusters:
+        mask = labels == cid
+        gids = sidx[mask] if sidx is not None else np.where(mask)[0]
+        examples = [voc.get(int(i), "").strip() for i in gids]
+        examples = [e for e in examples if e and e != "?" and len(e) > 0]
+        n_total = len(examples)
+
+        # Subsample for analysis
+        if len(examples) > max_examples:
+            rng = np.random.default_rng(42)
+            idx = rng.choice(len(examples), max_examples, replace=False)
+            examples = [examples[i] for i in sorted(idx)]
+
+        label = heuristic_label_cluster(examples)
+        cluster_labels[cid] = f"{label} ({n_total})"
+        con.print(f"  [green]C{cid}[/green]: {label} ({n_total} tokens)")
+
+    return cluster_labels
+
 # ── Layer 4: Comparison ──────────────────────────────────────
 
 def compare_tokens(X, ids):
@@ -883,7 +988,7 @@ def generate_llm_labels(n_clicks, mn, method, k, dim_str, max_ex, existing_label
         labels = cluster(X_for_cluster, k=k)
 
         con.print(f"[cyan]Generating LLM labels for {len(np.unique(labels))} clusters…[/cyan]")
-        cl = llm_label_all_clusters(model, tok, labels, voc, sidx, max_examples=max_ex)
+        cl = heuristic_label_all_clusters(labels, voc, sidx, max_examples=max_ex)
         con.print(f"[green]✓ Generated {len(cl)} cluster labels[/green]")
 
         return json.dumps({str(k2): v2 for k2, v2 in cl.items()}), f"✓ {len(cl)} labels generated"
